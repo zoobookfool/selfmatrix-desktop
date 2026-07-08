@@ -129,10 +129,39 @@ function claimWidgetTransport() {
   };
 }
 
-contextBridge.exposeInMainWorld("selfmatrixNative", {
-  getStatus: () => ipcRenderer.invoke("native:get-status"),
-  ensureCallView: () => ipcRenderer.invoke("native:ensure-call-view"),
-  detachCallView: () => ipcRenderer.invoke("native:detach-call-view"),
-  attachCallView: () => ipcRenderer.invoke("native:attach-call-view"),
-  claimWidgetTransport,
-});
+// M2 セキュリティ監査 (「shell の API 露出面整理」): getStatus/ensureCallView/detachCallView/
+// attachCallView は cinny 側の契約 (nativeBridge.ts の SelfmatrixNativeBridge = claimWidgetTransport
+// のみ) に一切現れず、cinny 本体からも呼ばれない harness/デモ由来の残骸だった。全数調査の結果:
+//   - getStatus/detachCallView/attachCallView を実際に呼ぶのは desktop-shell.js (harness UI の
+//     ボタンハンドラ) だけ。
+//   - ensureCallView を実際に呼ぶのは shell-widget-host.js の sendAction() (harness の
+//     ClientWidgetApi ラッパ) だけ。
+//   - どちらも harness トポロジ (desktop-shell.html がトップフレーム、cinny は同一オリジンの
+//     iframe として埋め込まれるだけ) でしか読み込まれないスクリプトで、本番 topology
+//     (--cinny-shell、cinny 自身がトップフレーム) では配信すらされない。
+// これらは claim-once (claimWidgetTransport()) の外側に常時公開されていたため、本番 topology では
+// cinny のフレーム内で動く任意のコード (侵害された依存/プラグイン等、cinny 自身の契約外) が
+// ユーザー操作なしに detach/attach (WebContentsView 再親子付け) や call view 生成を起こせる面に
+// なっていた。main.cjs の createMainWindow() が additionalArguments 経由でこのウィンドウの
+// トポロジ (--selfmatrix-shell-topology=cinny-shell|harness) を渡してくるので、harness トポロジの
+// ときだけこの 4 メソッドを追加する — 本番 topology では window.selfmatrixNative は
+// claimWidgetTransport 一本だけになる。
+//
+// E2E (__selfmatrixE2E.detachCallView()/attachCallView() 等、main.cjs の setupE2EIntrospection()
+// 参照) はこの window.selfmatrixNative 経由の bridge ではなく、playwright-core の
+// electronApp.evaluate() で main プロセスのモジュールスコープ関数を直接呼ぶ別経路なので、
+// この変更の影響を受けない。E2E は常に --cinny-shell (本番 topology) で起動する
+// (e2e/native-join.e2e.mjs, e2e/lib/nativeE2ELib.mjs 参照) ため、むしろこのゲートにより
+// window.selfmatrixNative 経由でも harness 専用 API に触れられないことが本番相当の条件で
+// 保証される。
+const isHarnessTopology = process.argv.includes("--selfmatrix-shell-topology=harness");
+
+const selfmatrixNativeApi = { claimWidgetTransport };
+if (isHarnessTopology) {
+  selfmatrixNativeApi.getStatus = () => ipcRenderer.invoke("native:get-status");
+  selfmatrixNativeApi.ensureCallView = () => ipcRenderer.invoke("native:ensure-call-view");
+  selfmatrixNativeApi.detachCallView = () => ipcRenderer.invoke("native:detach-call-view");
+  selfmatrixNativeApi.attachCallView = () => ipcRenderer.invoke("native:attach-call-view");
+}
+
+contextBridge.exposeInMainWorld("selfmatrixNative", selfmatrixNativeApi);

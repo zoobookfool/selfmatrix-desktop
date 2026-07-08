@@ -470,7 +470,28 @@ function createMainWindow() {
       preload: path.join(__dirname, "shell-preload.cjs"),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      // M2 セキュリティ監査 (「shell の API 露出面整理」、sandbox 再評価): 以前は sandbox:false
+      // だった。harness トポロジでは shell-widget-host.js が本物の ClientWidgetApi をこの
+      // フレームの通常ページスクリプトとして構築する都合があったが、これは preload の Node 権限
+      // (nodeIntegration/sandbox) とは無関係 — <script> で読み込まれるページスクリプトは
+      // nodeIntegration:false の時点で常に Node 非統合であり、sandbox はあくまで preload 自身が
+      // 使える Node API の範囲と OS レベルのプロセスサンドボックスを絞るだけで、ページ側の
+      // DOM/JS 実行には影響しない。実際、call view (createCallViewIfNeeded() 参照) の
+      // widget-bridge-preload.cjs/call-control-preload.cjs はどちらも sandbox:true 下で
+      // require("electron") のみを使って動作済み (call-control-preload.cjs 冒頭コメント参照)。
+      // shell-preload.cjs も require("electron") 以外は使わないため、sandbox:true でも
+      // contextBridge.exposeInMainWorld()/ipcRenderer は変わらず動く。本番 topology
+      // (--cinny-shell、cinny がトップフレーム) で mainWindow の Node 権限面を追加で絞れる
+      // 実利があるため sandbox:true 化した。smoke (harness 前提)・cinny-shell-smoke の両方が
+      // green のままであることを確認済み (完了報告の検証出力参照)。
+      sandbox: true,
+      // M2 セキュリティ監査 (契約外 API の露出面整理): shell-preload.cjs へ「このウィンドウが
+      // 本番 topology (cinny トップフレーム) なのか harness トポロジなのか」を伝える唯一の経路。
+      // preload は contextIsolation 下でも Node 権限を保つため process.argv を読めるが、main
+      // プロセス自身の process.argv (Electron 起動時のコマンドライン全体、--smoke 等を含む) を
+      // そのままレンダラ側 process.argv として引き継ぐ保証は無い (Electron の内部実装詳細に
+      // 依存させたくない) — 代わりに additionalArguments で明示的に 1 個だけフラグを渡す。
+      additionalArguments: [`--selfmatrix-shell-topology=${isCinnyShell ? "cinny-shell" : "harness"}`],
       // Chromium は非表示/最小化/occluded 判定したウィンドウの timer/requestAnimationFrame を
       // 間引く (Electron の既定は間引く=true)。この画面外配置 (E2E) や将来のユーザーによる最小化/
       // タブ切り替え中でも、通話中の keep-alive 描画や WebRTC 関連タイマーは止めたくないため、
@@ -483,7 +504,9 @@ function createMainWindow() {
   // mainWindow が harness (desktop-shell.html + cinny iframe) ではなく cinny 本体を直接
   // トップフレームでロードする、本番同様の topology。既定/--smoke/--memory-probe は
   // 従来どおり desktop-shell.html (harness) を維持する。preload (shell-preload.cjs) は
-  // どちらのモードでも同一 — window.selfmatrixNative は常にこの preload が公開する。
+  // どちらのモードでも同一 — window.selfmatrixNative は常にこの preload が公開する
+  // (ただし M2 セキュリティ監査以降、公開されるメソッドの集合は additionalArguments で渡した
+  // トポロジによって変わる。shell-preload.cjs 冒頭のコメント参照)。
   //
   // M1 step 3c-1 (実機テストで発覚、修正): 以前はここで `${origin}/cinny/` (パスプレフィックス
   // 付き) をロードしていたが、cinny の React Router は basename="/" (build.config.ts の
@@ -1172,19 +1195,36 @@ function invokeCallControl(action) {
 }
 
 function setupIpc() {
-  ipcMain.handle("native:get-status", () => ({
-    origin: state.origin,
-    callViewState: state.callViewState,
-    widgetMessageCount: state.widgetMessages.length,
-    cinnyDist,
-    ecDist,
-  }));
-  // M1 step 3b: window.selfmatrixNative.ensureCallView() は「create-only」ガードのまま残す
-  // (harness の detach/attach デモや sendWidgetActionFromShell() の F3 対策が使う想定)。
-  // URL 付きのロードは claim 済みトランスポートの openCallView() に一本化した。
-  ipcMain.handle("native:ensure-call-view", () => createCallViewIfNeeded());
-  ipcMain.handle("native:detach-call-view", () => detachCallView());
-  ipcMain.handle("native:attach-call-view", () => attachCallView());
+  // M2 セキュリティ監査 (「shell の API 露出面整理」): get-status/ensure-call-view/
+  // detach-call-view/attach-call-view の 4 チャンネルは harness (desktop-shell.js /
+  // shell-widget-host.js) だけが叩く実装で、cinny 側の契約 (nativeBridge.ts の
+  // SelfmatrixNativeBridge = claimWidgetTransport のみ) には現れず、cinny 本体からも一度も
+  // 呼ばれない (全数調査の結果は完了報告参照)。shell-preload.cjs は本番 topology
+  // (isCinnyShell) では window.selfmatrixNative にこれらのメソッドをそもそも公開しない
+  // (shell-preload.cjs 冒頭コメント参照) — 呼び出し口が無いのだから、ipcMain 側のチャンネル
+  // 登録自体も本番プロセスでは行わず、harness トポロジのときだけ登録する (登録された
+  // チャンネルは preload/contextBridge を介さない限りレンダラから到達できないので二重の
+  // 意味は薄いが、「そもそも存在しない」方が監査上も明快なため揃える)。
+  // runSmoke()/runMemoryProbe() (harness トポロジでのみ実行される、package.json 参照) の
+  // detachCallView()/attachCallView() 呼び出しはこの IPC チャンネルを経由しない main.cjs
+  // モジュールスコープ関数への直接呼び出しであり、影響を受けない。E2E
+  // (__selfmatrixE2E.detachCallView() 等) も同様に直接呼び出しで、これらのチャンネルには
+  // 依存しない。
+  if (!isCinnyShell) {
+    ipcMain.handle("native:get-status", () => ({
+      origin: state.origin,
+      callViewState: state.callViewState,
+      widgetMessageCount: state.widgetMessages.length,
+      cinnyDist,
+      ecDist,
+    }));
+    // M1 step 3b: window.selfmatrixNative.ensureCallView() は「create-only」ガードのまま残す
+    // (harness の detach/attach デモや sendWidgetActionFromShell() の F3 対策が使う想定)。
+    // URL 付きのロードは claim 済みトランスポートの openCallView() に一本化した。
+    ipcMain.handle("native:ensure-call-view", () => createCallViewIfNeeded());
+    ipcMain.handle("native:detach-call-view", () => detachCallView());
+    ipcMain.handle("native:attach-call-view", () => attachCallView());
+  }
 
   // M1 step 3b (design §3 step 3b 実装要件 1/2): claimWidgetTransport() が返す
   // openCallView(completeWidgetUrl)/closeCallView() の main 側実体。
@@ -1892,6 +1932,28 @@ async function runCinnyShellSmoke() {
   // との不一致で誤ルーティングが起きるのを実機で確認したため、上の win.loadURL() コメント参照)。
   const cinnyTopFrame = topFrameUrl === `${state.origin}/`;
 
+  // 1b. (M2 セキュリティ監査「shell の API 露出面整理」): 本番 topology で window.selfmatrixNative
+  // に実際に公開されているキー集合を実測する。cinny 側の契約 (nativeBridge.ts の
+  // SelfmatrixNativeBridge) が要求するのは claimWidgetTransport だけで、getStatus/ensureCallView/
+  // detachCallView/attachCallView は harness (desktop-shell.js/shell-widget-host.js) 専用の
+  // 残骸だった — shell-preload.cjs は additionalArguments 経由のトポロジ判定
+  // (--selfmatrix-shell-topology) が harness のときだけこの 4 メソッドを追加する
+  // (shell-preload.cjs 冒頭コメント参照)。この smoke は常に --cinny-shell-smoke (本番 topology、
+  // createMainWindow() の isCinnyShell 分岐) で起動するため、ここで実測したキー集合が
+  // ["claimWidgetTransport"] 以外の何かを含んでいれば、契約外 API が本番 topology の cinny
+  // フレームへ漏れ出す回帰が起きたことを意味し、この smoke は FAIL する。
+  const exposedSelfmatrixNativeKeys = await win.webContents.executeJavaScript(
+    `Object.keys(window.selfmatrixNative).sort()`,
+    true,
+  );
+  const contractSurfaceGate = {
+    exposedKeys: exposedSelfmatrixNativeKeys,
+    pass:
+      Array.isArray(exposedSelfmatrixNativeKeys) &&
+      exposedSelfmatrixNativeKeys.length === 1 &&
+      exposedSelfmatrixNativeKeys[0] === "claimWidgetTransport",
+  };
+
   // 2. 通話 1 本分の transport を一度だけ claim し (real NativeCallEmbed のコンストラクタが
   // claimWidgetTransport() を呼ぶのと同じ操作)、以降の全ステップで使い回す。onCallControlState()
   // の購読もここで一度だけ登録する (design §3 step 3b 実装要件 4 の受信側)。
@@ -2200,6 +2262,7 @@ async function runCinnyShellSmoke() {
     pass:
       bridgePresent &&
       cinnyTopFrame &&
+      contractSurfaceGate.pass &&
       Boolean(claimGuard) &&
       Object.values(urlValidationGate).every((check) => check.pass) &&
       validOpenCallView.pass &&
@@ -2209,6 +2272,7 @@ async function runCinnyShellSmoke() {
       mainWindowNavigationContainment.pass,
     bridgePresent,
     cinnyTopFrame,
+    contractSurfaceGate,
     claimGuard,
     urlValidationGate: deepSanitizeEvidence(urlValidationGate),
     validOpenCallView,
