@@ -1,0 +1,31 @@
+{
+  "name": "selfmatrix-desktop",
+  "productName": "SelfMatrix",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "SelfMatrix native desktop shell (Electron) embedding cinny + Element Call.",
+  "repository": {
+    "type": "git",
+    "url": "github:zoobookfool/selfmatrix-desktop"
+  },
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron src/main.cjs",
+    "smoke": "electron src/main.cjs --smoke",
+    "memory": "electron src/main.cjs --memory-probe",
+    "cinny-shell": "electron src/main.cjs --cinny-shell",
+    "cinny-shell-smoke": "electron src/main.cjs --cinny-shell-smoke",
+    "test": "npm run smoke && npm run memory && npm run cinny-shell-smoke",
+    "probe:system-audio": "electron src/system-audio-probe.cjs",
+    "probe:app-audio-capture": "electron src/app-audio-capture-probe.cjs",
+    "e2e:join": "node e2e/native-join.e2e.mjs",
+    "e2e:callflow": "node e2e/native-callflow.e2e.mjs"
+  },
+  "devDependencies": {
+    "electron": "43.0.0"
+  },
+  "dependencies": {
+    "matrix-widget-api": "1.16.1"
+  }
+}

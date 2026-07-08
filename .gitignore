@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Evidence / test artifacts (screenshots, JSON result files).
+# This is a product repository: it does not keep evidence trails as a
+# first-class artifact (that convention lives in the selfmatrix-workspace
+# repo). A CI pipeline is expected to take over evidence capture later;
+# until then, evidence/ is local-only and never committed.
+evidence/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store
