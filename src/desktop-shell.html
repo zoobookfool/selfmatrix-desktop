@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SelfMatrix Native Prototype</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111217;
+        --panel: #20222a;
+        --line: #343743;
+        --text: #f1f2f5;
+        --muted: #a8acb8;
+        --accent: #5865f2;
+        --green: #23a55a;
+        --danger: #ed4245;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+
+      .toolbar {
+        height: 58px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        border-bottom: 1px solid var(--line);
+        background: #171922;
+      }
+
+      .title {
+        font-weight: 800;
+        margin-right: auto;
+      }
+
+      button {
+        height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 0 12px;
+        color: var(--text);
+        background: var(--panel);
+        font-weight: 700;
+      }
+
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+
+      button.danger {
+        background: var(--danger);
+        border-color: var(--danger);
+      }
+
+      .status {
+        height: 42px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 14px;
+        border-bottom: 1px solid var(--line);
+        background: #101117;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--danger);
+      }
+
+      .dot.ready {
+        background: var(--green);
+      }
+
+      .content {
+        position: relative;
+        height: calc(100vh - 100px);
+      }
+
+      iframe {
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #202225;
+      }
+
+      .dock-label {
+        position: absolute;
+        top: 14px;
+        right: 18px;
+        z-index: 2;
+        padding: 5px 9px;
+        border-radius: 5px;
+        background: rgba(0, 0, 0, 0.72);
+        color: #fff;
+        font-size: 12px;
+        pointer-events: none;
+      }
+
+      .log {
+        position: absolute;
+        left: 16px;
+        bottom: 16px;
+        width: 420px;
+        max-height: 160px;
+        overflow: auto;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 7px;
+        padding: 10px;
+        background: rgba(0, 0, 0, 0.76);
+        font: 12px/1.45 Consolas, monospace;
+        color: #e8eaf0;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="title">SelfMatrix Native Prototype</div>
+      <button class="primary" id="ensure-call">通話 View 起動</button>
+      <button id="detach-call">別窓へ移動</button>
+      <button id="attach-call">戻す</button>
+      <button id="join-call">Join</button>
+      <button id="mute-call">DeviceMute</button>
+      <button class="danger" id="hangup-call">Hangup</button>
+      <button id="call-control-toggle">CallControl Toggle</button>
+    </header>
+    <section class="status">
+      <span class="dot" id="ready-dot"></span>
+      <span id="origin">origin: loading</span>
+      <span id="call-state">call view: none</span>
+      <span id="bridge-state">bridge: waiting</span>
+    </section>
+    <main class="content">
+      <div class="dock-label">右側は EC WebContentsView の dock 領域</div>
+      <iframe id="cinny-frame" src="/cinny/" title="Cinny"></iframe>
+      <pre class="log" id="log"></pre>
+    </main>
+    <script src="/vendor/matrix-widget-api.js"></script>
+    <script src="/shell-widget-host.js"></script>
+    <script src="/desktop-shell.js"></script>
+  </body>
+</html>

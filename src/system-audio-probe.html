@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>selfmatrix system-audio-probe</title>
+  </head>
+  <body style="margin: 0; padding: 0; font-family: sans-serif">
+    <!--
+      SelfMatrix M1 step 3c-4: system audio (loopback) 実機確認プローブのページ側。
+      ボタンをビューポート全体に敷き詰めておき、system-audio-probe.cjs が
+      webContents.sendInputEvent() で送る trusted なマウスクリックを確実に拾えるようにしてある
+      (中心座標を狙えば必ずこの要素に当たる)。
+    -->
+    <button
+      id="start"
+      style="width: 100vw; height: 100vh; font-size: 20px; border: none; cursor: pointer"
+    >
+      start probe (clicked by main process via sendInputEvent)
+    </button>
+    <script>
+      window.__probeResult = null;
+      document.getElementById("start").addEventListener("click", () => {
+        // getDisplayMedia() は spec 上 transient user activation を要求する。click ハンドラの
+        // 最初の同期文でこの呼び出しを行うことで、trusted なクリックイベントがまだ持っている
+        // activation を消費する (await を挟んだ後では活性化が失効している可能性がある)。
+        const displayMediaPromise = navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+        (async () => {
+          try {
+            const stream = await displayMediaPromise;
+            const videoTracks = stream.getVideoTracks();
+            const audioTracks = stream.getAudioTracks();
+            const audioTrack = audioTracks[0] || null;
+
+            let analyserSampledWithoutCrash = false;
+            let analyserSampleCount = 0;
+            let analyserError = null;
+            let audioTrackReadyStateAfterSampling = null;
+
+            if (audioTrack) {
+              try {
+                // pass 条件のひとつ: WebAudio の AnalyserNode で数秒間サンプリングしてクラッシュ
+                // しないこと (無音で構わない — 可聴音の有無は問わない)。
+                const ctx = new AudioContext();
+                const source = ctx.createMediaStreamSource(stream);
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 2048;
+                source.connect(analyser);
+                const data = new Float32Array(analyser.fftSize);
+                const started = performance.now();
+                while (performance.now() - started < 3000) {
+                  analyser.getFloatTimeDomainData(data);
+                  analyserSampleCount += 1;
+                  await new Promise((resolve) => setTimeout(resolve, 200));
+                }
+                analyserSampledWithoutCrash = true;
+                audioTrackReadyStateAfterSampling = audioTrack.readyState;
+                await ctx.close();
+              } catch (error) {
+                analyserError = String(error && error.message ? error.message : error);
+              }
+            }
+
+            const result = {
+              ok: true,
+              videoTrackCount: videoTracks.length,
+              audioTrackCount: audioTracks.length,
+              audioTrackKind: audioTrack ? audioTrack.kind : null,
+              audioTrackReadyStateInitial: audioTrack ? audioTrack.readyState : null,
+              audioTrackReadyStateAfterSampling,
+              audioTrackLabel: audioTrack ? audioTrack.label : null,
+              analyserSampledWithoutCrash,
+              analyserSampleCount,
+              analyserError,
+            };
+            stream.getTracks().forEach((track) => track.stop());
+            window.__probeResult = result;
+          } catch (error) {
+            window.__probeResult = {
+              ok: false,
+              error: String(error && error.message ? error.message : error),
+              errorName: error && error.name ? error.name : null,
+            };
+          }
+        })();
+      });
+    </script>
+  </body>
+</html>
