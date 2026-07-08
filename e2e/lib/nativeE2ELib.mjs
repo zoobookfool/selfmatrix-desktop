@@ -15,8 +15,12 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import https from "node:https";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
+// This file lives at <repo>/e2e/lib/, so the repo root is two levels up.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..", "..");
 
 export const HOMESERVER = "https://synapse.m.localhost";
 export const ROOM_NAME = "Voice Lounge";
@@ -89,7 +93,7 @@ export async function checkBackendReachable({ log, failFast }) {
     failFast(
       `dev Matrix backend is unreachable at ${HOMESERVER} (${error.message}). ` +
         "Start it first: in the element-call checkout, run `pnpm backend` (requires Docker), " +
-        "then re-run this script. See native-prototype/README.md.",
+        "then re-run this script. See README.md.",
     );
     return;
   }
@@ -113,16 +117,21 @@ export function requireEnv(name, { failFast }) {
   return value;
 }
 
+// selfmatrix-desktop is developed alongside a sibling `../element-call` checkout (see README
+// "開発手順"). The default is resolved relative to this repo's own location, not to any
+// per-machine home directory layout (this repo is public).
 export function resolveElementCallDir({ failFast }) {
-  const dir =
-    process.env.SELFMATRIX_ELEMENT_CALL_DIR || path.join(os.homedir(), "Documents", "DiscordSub", "element-call");
+  const dir = process.env.SELFMATRIX_ELEMENT_CALL_DIR || path.resolve(repoRoot, "..", "element-call");
   if (!fs.existsSync(dir)) {
-    failFast(`element-call checkout not found at ${dir}. Set SELFMATRIX_ELEMENT_CALL_DIR to override.`);
+    failFast(
+      `element-call checkout not found at ${dir}. Clone it as a sibling of this repo ('../element-call'), ` +
+        "or set SELFMATRIX_ELEMENT_CALL_DIR to override.",
+    );
   }
   return dir;
 }
 
-// playwright-core is not a native-prototype dependency (this prototype only depends on
+// playwright-core is not a selfmatrix-desktop dependency (this repo only depends on
 // `electron` directly). Rather than adding a second copy, we borrow the one already installed
 // under element-call's pnpm store. The exact pnpm-hashed version directory name varies, so
 // resolve it by glob rather than hardcoding a version.
@@ -338,7 +347,7 @@ export function freshUserDataDir(prefix) {
 export async function launchNativePrototype({ nativePrototypeDir, elementCallDir, extraArgs = [], env = {} }) {
   const pwCoreDir = resolvePlaywrightCore(elementCallDir, makeLogger("native-e2e-lib"));
   const pw = require(pwCoreDir);
-  const electronPath = require("electron"); // native-prototype's own devDependency
+  const electronPath = require("electron"); // this repo's own devDependency
   const userDataDir = freshUserDataDir("selfmatrix-e2e-userdata-");
   const electronApp = await pw._electron.launch({
     executablePath: electronPath,

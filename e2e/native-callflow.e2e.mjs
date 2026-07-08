@@ -756,7 +756,7 @@ async function runWindowMoveReparenting(aliceApp, bobApp) {
 }
 
 // M1 step 3c-2 (localStorage 契約の実機確認): cinny (mainWindow) と call view は session
-// partition が異なるため (native-prototype/src/main.cjs の CALL_VIEW_PARTITION)、web 版で
+// partition が異なるため (src/main.cjs の CALL_VIEW_PARTITION)、web 版で
 // 成立していた「cinny が書く matrix-setting-* を EC が読む」契約 (screenShareSettings.ts /
 // element-call/src/settings/settings.ts) が分離後も生きるかは自明ではない -- 実測する。
 // このコミット時点でブリッジ (main.cjs の pendingLocalStorageSnapshot / openCallView() 第 2 引数 /

@@ -7,8 +7,8 @@
 // 含む MediaStream を返すことを実機 (このワークスペースの Windows 開発機) で確認する。
 //
 // なぜ main.cjs を直接使わず別ファイルにしたか: main.cjs の main() は cinny/EC の dist
-// (SELFMATRIX_CINNY_DIST / SELFMATRIX_EC_DIST、既定は Documents/DiscordSub 配下) が存在することを
-// 前提にした重い起動シーケンス (静的サーバ、mainWindow への cinny ロード、widget bridge 一式) を
+// (SELFMATRIX_CINNY_DIST / SELFMATRIX_EC_DIST、既定は sibling checkout `../cinny/dist` /
+// `../element-call/dist`) が存在することを前提にした重い起動シーケンス (静的サーバ、mainWindow への cinny ロード、widget bridge 一式) を
 // 持つ。今回検証したいのは `setDisplayMediaRequestHandler` → `getDisplayMedia()` という
 // Electron/Chromium 単体の経路であり、cinny/EC 本体を経由する必要が無い。運用ルール
 // (native-milestones.md「実行可能コードの workspace 運用ルール」1: 置けるのは検証入口だけ) に
@@ -114,10 +114,10 @@ async function waitForProbeResult(win, timeoutMs) {
   return null;
 }
 
-// evidence はコミット対象 (native-milestones.md の運用ルール 3) なので、秘匿情報 (このマシンの
-// ユーザー名を含む絶対パス、ローカル IPv4 等) が万一 audioTrackLabel 等の文字列フィールドに
-// 混入していても機械的に伏せる。origin (127.0.0.1:<port>) は毎回変わるだけで秘匿情報ではないが、
-// 同じ方針で伏せておく。
+// evidence/ はこのリポジトリでは .gitignore 済み (コミットされない、ローカル専用) だが、
+// 手動での共有・調査時に秘匿情報が残らないよう、念のため機械的に伏せておく (このマシンの
+// ユーザー名を含む絶対パス、ローカル IPv4 等)。origin (127.0.0.1:<port>) は毎回変わるだけで
+// 秘匿情報ではないが、同じ方針で伏せておく。
 function sanitizeString(value) {
   if (typeof value !== "string") return value;
   let out = value.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "<ipv4>");

@@ -7,7 +7,6 @@ try {
 const { app, BrowserWindow, WebContentsView, desktopCapturer, ipcMain, session, shell } = electron;
 const fs = require("node:fs");
 const http = require("node:http");
-const os = require("node:os");
 const path = require("node:path");
 
 // Electron 非依存の Widget API bridge 純関数群は widget-bridge-protocol.cjs に集約されている。
@@ -103,7 +102,7 @@ const isCinnyShellSmoke = process.argv.includes("--cinny-shell-smoke");
 const isCinnyShell = isCinnyShellSmoke || process.argv.includes("--cinny-shell");
 
 // SelfMatrix M1 step 3c-1: ネイティブシェルからの実ログイン → 実 LiveKit join を検証する
-// E2E (native-prototype/e2e/native-join.e2e.mjs) 専用モード。--cinny-shell と併用する
+// E2E (e2e/native-join.e2e.mjs) 専用モード。--cinny-shell と併用する
 // (トポロジは --cinny-shell が決める。このフラグは E2E 計装だけを追加で有効にする)。
 // **dev/E2E 実行専用— 本番/通常起動では絶対にこのフラグを渡さないこと。**
 const isE2ERealJoin = process.argv.includes("--e2e-real-join");
@@ -262,9 +261,16 @@ if (app) {
   });
 }
 
+// selfmatrix-desktop is developed alongside sibling checkouts of cinny and
+// element-call (see README "開発手順"). The default artifact locations are
+// therefore resolved relative to this repository's own location
+// (<repo>/../cinny/dist, <repo>/../element-call/dist), not to any
+// per-machine home directory layout -- this repo is public and must not
+// assume a particular developer's folder structure. Set SELFMATRIX_CINNY_DIST
+// / SELFMATRIX_EC_DIST to override (absolute or relative to cwd).
 function resolveArtifact(envName, relativeParts) {
   if (process.env[envName]) return path.resolve(process.env[envName]);
-  return path.join(os.homedir(), "Documents", "DiscordSub", ...relativeParts);
+  return path.resolve(appRoot, "..", ...relativeParts);
 }
 
 const cinnyDist = resolveArtifact("SELFMATRIX_CINNY_DIST", ["cinny", "dist"]);
@@ -352,7 +358,7 @@ function startServer() {
       return;
     }
     if (url.pathname === "/vendor/matrix-widget-api.js") {
-      // native-prototype に pinned dependency として追加した matrix-widget-api の browserify 済み
+      // このリポジトリに pinned dependency として追加した matrix-widget-api の browserify 済み
       // UMD バンドル (window.mxwidgets を公開)。shell-widget-host.js の冒頭コメント参照:
       // ClientWidgetApi をページの通常スクリプトコンテキストで動かすため <script> で読み込む。
       serveFile(response, path.join(appRoot, "node_modules", "matrix-widget-api", "dist", "api.js"));
@@ -2290,10 +2296,18 @@ function setupE2EIntrospection() {
 async function main() {
   await app.whenReady();
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
-    throw new Error(`Cinny dist not found: ${cinnyDist}`);
+    throw new Error(
+      `Cinny dist not found: ${cinnyDist}\n` +
+        "Build it first: in a sibling '../cinny' checkout, run 'npm run build' (output goes to '../cinny/dist').\n" +
+        "Or point SELFMATRIX_CINNY_DIST at an existing build directory.",
+    );
   }
   if (!fs.existsSync(path.join(ecDist, "index.html"))) {
-    throw new Error(`Element Call dist not found: ${ecDist}`);
+    throw new Error(
+      `Element Call dist not found: ${ecDist}\n` +
+        "Build it first: in a sibling '../element-call' checkout, run 'pnpm build:embedded' (output goes to '../element-call/dist').\n" +
+        "Or point SELFMATRIX_EC_DIST at an existing build directory.",
+    );
   }
 
   setupIpc();
@@ -2324,5 +2338,5 @@ if (app) {
     app.exit(1);
   });
 } else if (require.main === module) {
-  throw new Error("native-prototype requires Electron. Use `electron src/main.cjs`.");
+  throw new Error("selfmatrix-desktop requires Electron. Use `electron src/main.cjs`.");
 }

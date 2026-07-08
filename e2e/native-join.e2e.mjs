@@ -24,7 +24,7 @@
  *   - `element-call` ディレクトリで `pnpm install` 済みであること (playwright-core を
  *     glob 解決で借用するため)。
  *
- * 実行手順の詳細は native-prototype/README.md の「E2E: 実ログイン→実 LiveKit join
+ * 実行手順の詳細は README.md の「E2E: 実ログイン→実 LiveKit join
  * (M1 step 3c-1)」節を参照。
  *
  * **dev/E2E 専用**: Electron 起動引数に `--e2e-real-join` を渡す。main.cjs 側はこのフラグ
@@ -78,7 +78,7 @@ async function main() {
   const { createRequire } = await import("node:module");
   const require = createRequire(import.meta.url);
   const pw = require(pwCoreDir);
-  const electronPath = require("electron"); // native-prototype's own devDependency
+  const electronPath = require("electron"); // this repo's own devDependency
   const os = require("node:os");
 
   const freshUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "selfmatrix-e2e-userdata-"));

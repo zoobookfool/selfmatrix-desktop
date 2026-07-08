@@ -209,7 +209,7 @@ function isWidgetApiMessage(data) {
 
 // M1 step 1 以降、このスタブ応答はライブ経路 (main.cjs のルータ) からは呼ばれない。
 // 実際の応答は shell 側の本物の ClientWidgetApi / CallWidgetDriver 相当
-// (native-prototype/src/shell-widget-host.js の NativeWidgetDriver) が生成する
+// (src/shell-widget-host.js の NativeWidgetDriver) が生成する
 // (design/native-widget-transport.md §2.1)。この純関数は test-harness/cli/widget-protocol.mjs が
 // widget-bridge-preload.cjs の応答折り返し配線 (request→response のラウンドトリップ形状) を単体で
 // 検証するためだけに残してある。
