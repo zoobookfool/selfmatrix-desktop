@@ -54,7 +54,11 @@ let callControlInvokeSeq = 0;
 // call view (EC WebContentsView) の永続パーティション名。createCallViewIfNeeded() の
 // WebContentsView 生成と、call-control-preload.cjs を 2 本目の preload として登録する
 // session.fromPartition() の両方から同じ文字列を参照する必要があるため定数化した。
-const CALL_VIEW_PARTITION = "persist:selfmatrix-native-prototype-call";
+// M2 readiness レビュー修正 (GPT 指摘 C/D): "prototype" 名の残りを剥がすため
+// "persist:selfmatrix-native-prototype-call" から改名した。session partition 名は Electron 内部の
+// 実装詳細であり cinny 側からは一切参照されない (widget-bridge-protocol.cjs の WIDGET_ID 改名コメント
+// 参照) ため、cinny 側の追随は不要。
+const CALL_VIEW_PARTITION = "persist:selfmatrix-native-call";
 
 // C1 (GPT レビュー P1b, 実バグ修正): session.fromPartition(...).registerPreloadScript() は
 // **session パーティション単位で累積登録される** (呼び出しごとに追加され、同じフレーム種別の
@@ -98,8 +102,21 @@ const isMemoryProbe = process.argv.includes("--memory-probe");
 // desktop-shell.html ではなく <origin>/cinny/ を直接ロードする、本番 topology)。
 // --cinny-shell-smoke はそのモードで item 7 の自動判定を行う専用フラグで、常に
 // トップフレームモードのロードも伴う。
+//
+// M2 readiness レビュー修正 (GPT 指摘 A): 通常起動 (フラグ無し) の既定はこれまで harness
+// モード (desktop-shell.html + cinny を iframe 埋め込み) だった — 製品リポジトリとして公開する
+// 以上、通常起動の既定は本番 topology (cinny トップフレーム) であるべきで、旧来の harness は
+// 明示的に選んだときだけ出てくる検証専用モードに格下げする。ここで isCinnyShell の既定を反転し、
+// 新設した --harness フラグを「明示的に harness へ戻す」唯一の経路にした。
+// --cinny-shell / --cinny-shell-smoke は「明示的にトップフレームを要求する」互換フラグとして
+// 引き続き認識する (無くても既定で同じ結果になるが、既存の README/E2E がこれらを渡し続けても
+// 壊れないようにするため)。smoke/memory-probe は harness 前提のテスト経路 (shell-widget-host.js
+// の自動 boot に依存する、runSmoke()/runMemoryProbe() 参照) なので、package.json 側でこれらの
+// npm script に --harness を追加した — isSmoke/isMemoryProbe 自体はこの分岐には関与しない
+// (あくまで --harness の有無だけで決まる)。
+const isHarness = process.argv.includes("--harness");
 const isCinnyShellSmoke = process.argv.includes("--cinny-shell-smoke");
-const isCinnyShell = isCinnyShellSmoke || process.argv.includes("--cinny-shell");
+const isCinnyShell = isCinnyShellSmoke || process.argv.includes("--cinny-shell") || !isHarness;
 
 // SelfMatrix M1 step 3c-1: ネイティブシェルからの実ログイン → 実 LiveKit join を検証する
 // E2E (e2e/native-join.e2e.mjs) 専用モード。--cinny-shell と併用する
@@ -442,7 +459,7 @@ function startServer() {
 
 function createMainWindow() {
   const win = new BrowserWindow({
-    title: "SelfMatrix Native Prototype",
+    title: "SelfMatrix",
     width: 1400,
     height: 860,
     show: !isSmoke && !isCinnyShellSmoke,
@@ -489,21 +506,40 @@ function createMainWindow() {
   // "will-navigate"/"will-redirect" は in-page navigation では発火しない (ユーザー操作/ページ自身の
   // window.location 変更/リンククリック/サーバリダイレクトなどのトップレベル遷移でのみ発火する) —
   // そのため以下の制限は cinny の通常のルーティング動作を妨げない。
-  const isSameOriginAsShell = (url) => {
+  //
+  // B (M2 readiness レビュー修正、GPT 指摘 B): 上の C3 修正は same-origin かどうかしか見ておらず
+  // 広すぎた。startServer() は同一 origin で cinny 自身の他に /ec/・/public/element-call/ (EC dist)・
+  // /desktop-shell.html (harness)・/vendor/ (matrix-widget-api バンドル) も配信しており、mainWindow が
+  // これらへトップレベル document 遷移すると、mainWindow が持つ shell-preload.cjs の bridge が
+  // (same-origin なので) そのまま意図しないページ上に再注入されてしまう。cinny 自身の React Router は
+  // オリジン配下の任意のパス (個々の room/space パス等) を使い得るため、cinny の path を厳密な
+  // allow-list にはできない — 代わりに「cinny の document ではないと分かっている既知の配信先」だけを
+  // block する block-list にし、過剰に締めて cinny 自身の初回ロードや通常のルーティングを壊さない
+  // ようにした。/ec/・/public/element-call/・/vendor/ はトポロジ (production/harness) に関わらず常に
+  // 「cinny の document ではない」ため常時 block する。/desktop-shell.html だけは harness トポロジ
+  // (isCinnyShell === false) では mainWindow 自身の正当な document (この関数の win.loadURL() 参照) な
+  // ので、その場合に限り許可する。
+  const NON_CINNY_DOCUMENT_PATH_PREFIXES = Object.freeze(["/ec/", "/public/element-call/", "/vendor/"]);
+  const isAllowedMainWindowDocumentNavigation = (url) => {
+    let parsed;
     try {
-      return new URL(url).origin === state.origin;
+      parsed = new URL(url);
     } catch (error) {
       return false;
     }
+    if (parsed.origin !== state.origin) return false;
+    if (NON_CINNY_DOCUMENT_PATH_PREFIXES.some((prefix) => parsed.pathname.startsWith(prefix))) return false;
+    if (parsed.pathname === "/desktop-shell.html") return !isCinnyShell;
+    return true;
   };
   win.webContents.on("will-navigate", (event, url) => {
-    if (!isSameOriginAsShell(url)) {
+    if (!isAllowedMainWindowDocumentNavigation(url)) {
       event.preventDefault();
       state.widgetMessages.push({ t: Date.now(), type: "main-window-navigation-blocked", url, via: "will-navigate" });
     }
   });
   win.webContents.on("will-redirect", (event, url) => {
-    if (!isSameOriginAsShell(url)) {
+    if (!isAllowedMainWindowDocumentNavigation(url)) {
       event.preventDefault();
       state.widgetMessages.push({ t: Date.now(), type: "main-window-navigation-blocked", url, via: "will-redirect" });
     }
@@ -2125,17 +2161,39 @@ async function runCinnyShellSmoke() {
       return false;
     }
   })();
+
+  // B (M2 readiness レビュー修正、GPT 指摘 B の回帰検証): 上のクロスオリジン検証と同型で、
+  // 「同一オリジンだが cinny の document ではない既知の配信先 (/ec/)」へのトップレベル遷移も
+  // block されることを確認する。createMainWindow() の isAllowedMainWindowDocumentNavigation() が
+  // same-origin かどうかだけで判定していた旧実装ではこのケースは許可されてしまっていた
+  // (同一オリジンのため) — この smoke はその回帰を検知する。
+  const sameOriginEcNavTarget = `${state.origin}/ec/index.html`;
+  const ecNavBefore = state.widgetMessages.length;
+  await win.webContents
+    .executeJavaScript(`window.location.href = ${JSON.stringify(sameOriginEcNavTarget)}`, true)
+    .catch(() => {});
+  await wait(300);
+  const ecNavBlockedRecord = state.widgetMessages
+    .slice(ecNavBefore)
+    .find((message) => message.type === "main-window-navigation-blocked" && message.url === sameOriginEcNavTarget);
+  const urlAfterEcNavAttempt = win.webContents.getURL();
+
   const mainWindowNavigationContainment = {
     crossOriginNavAttemptedUrl: sanitizeEvidenceString(crossOriginNavTarget),
     crossOriginNavBlocked: Boolean(navBlockedRecord),
     topFrameStillSameOrigin,
     topFrameNotAtMaliciousUrl: urlAfterNavAttempt !== crossOriginNavTarget,
     windowOpenBlocked: Boolean(windowOpenOutcome && windowOpenOutcome.popupIsNull === true),
+    sameOriginEcPathNavAttemptedUrl: sanitizeEvidenceString(sameOriginEcNavTarget),
+    sameOriginEcPathNavBlocked: Boolean(ecNavBlockedRecord),
+    sameOriginEcPathNotNavigated: urlAfterEcNavAttempt !== sameOriginEcNavTarget,
     pass:
       Boolean(navBlockedRecord) &&
       topFrameStillSameOrigin &&
       urlAfterNavAttempt !== crossOriginNavTarget &&
-      Boolean(windowOpenOutcome && windowOpenOutcome.popupIsNull === true),
+      Boolean(windowOpenOutcome && windowOpenOutcome.popupIsNull === true) &&
+      Boolean(ecNavBlockedRecord) &&
+      urlAfterEcNavAttempt !== sameOriginEcNavTarget,
   };
 
   const result = {

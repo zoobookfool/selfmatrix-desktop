@@ -12,8 +12,9 @@
   "main": "src/main.cjs",
   "scripts": {
     "start": "electron src/main.cjs",
-    "smoke": "electron src/main.cjs --smoke",
-    "memory": "electron src/main.cjs --memory-probe",
+    "harness": "electron src/main.cjs --harness",
+    "smoke": "electron src/main.cjs --smoke --harness",
+    "memory": "electron src/main.cjs --memory-probe --harness",
     "cinny-shell": "electron src/main.cjs --cinny-shell",
     "cinny-shell-smoke": "electron src/main.cjs --cinny-shell-smoke",
     "test": "npm run smoke && npm run memory && npm run cinny-shell-smoke",

@@ -6,7 +6,7 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
 
 ## アーキテクチャ概要
 
-- **トップフレームは cinny 本体。** ブラウザ版のような `<origin>/cinny/` 以下へのパスプレフィックスは無く、cinny の React Router がオリジンのルートを直接占有する (`--cinny-shell` トポロジ、本番と同一)。
+- **トップフレームは cinny 本体。** ブラウザ版のような `<origin>/cinny/` 以下へのパスプレフィックスは無く、cinny の React Router がオリジンのルートを直接占有する (フラグ無しの通常起動が既定でこのトポロジになる。内部的には `--cinny-shell` と呼ぶ)。
 - **通話は iframe ではなく `WebContentsView`。** Element Call (ウィジェット専用ビルド `@element-hq/element-call-embedded` 相当の dist) を、cinny のウィンドウに `addChildView()` で重ねて表示する。cinny の実レイアウト (通話バーの位置・サイズ) に追従させるための bounds 同期も実装済み。
 - **契約 (プロトコル) の正本は cinny 側。** iframe が存在しないネイティブ環境で `matrix-widget-api` のハンドシェイクや call-control 操作を成立させるための契約 (`window.selfmatrixNative` / `NativeCallControlAction` など) は、cinny fork の [`src/app/plugins/call/native/nativeBridge.ts`](https://github.com/zoobookfool/selfmatrix-cinny) が定義する。このリポジトリの役割は、その契約が要求する **shell 側の実装** を提供することに限られる — 契約自体を変更する場合は cinny 側から始めること。
 - **shell 側の実装 (`src/`)**:
@@ -14,7 +14,7 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
   - `widget-bridge-protocol.cjs` — Electron に依存しない純関数群 (URL 検証・メッセージ検証)。`main.cjs` はここへ委譲するだけで、判定ロジックを二重実装しない。
   - `shell-preload.cjs` / `shell-widget-host.js` — cinny 側 (mainWindow) の preload と、本物の `ClientWidgetApi` を動かす通常スクリプト。`claimWidgetTransport()` が通話 1 本につき 1 回だけ払い出す transport オブジェクトが `window.selfmatrixNative` として cinny から見える。
   - `call-control-preload.cjs` — 通話 View (Element Call) 側の preload。screenshare/spotlight/emphasis/reactions/settings/sound の実 DOM 操作を担当し、host からは RPC 経由でのみ駆動される。
-  - `desktop-shell.html` / `desktop-shell.js` — cinny を iframe として埋め込む harness モード (`--smoke`/`--memory-probe` などバックエンド無しでの自動検証用。本番の `--cinny-shell` トポロジとは別)。
+  - `desktop-shell.html` / `desktop-shell.js` — cinny を iframe として埋め込む harness モード (`--harness` を明示指定したとき、または `--smoke`/`--memory-probe` などバックエンド無しでの自動検証用に使う。本番トポロジ (既定の起動、`--cinny-shell` 相当) とは別)。
   - `system-audio-probe.cjs` / `app-audio-capture-probe.cjs` — システム音声 (loopback) キャプチャとアプリ単位音声キャプチャの実機確認用スタンドアロン Electron スクリプト (`npm test` には含まれない)。
 
 ## 開発手順
@@ -39,9 +39,11 @@ $env:SELFMATRIX_EC_DIST = "C:\path\to\element-call\dist"
 
 ```powershell
 npm install
-npm start            # harness モード (desktop-shell.html + cinny を iframe 埋め込み)
-npm run cinny-shell   # cinny 本体をトップフレームで直接ロードする本番同様のトポロジ
+npm start            # 本番同様のトポロジ (cinny 本体をトップフレームで直接ロード) — 既定
+npm run harness       # harness モード (desktop-shell.html + cinny を iframe 埋め込み、検証用)
 ```
+
+`npm run cinny-shell` は `npm start` と同じ結果になる (`--cinny-shell` は「明示的に本番トポロジを要求する」互換フラグとして残してあるだけで、フラグ無しの既定と挙動は変わらない)。
 
 ## テストと E2E の実行方法
 

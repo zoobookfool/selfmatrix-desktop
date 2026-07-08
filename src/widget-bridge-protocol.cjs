@@ -2,7 +2,12 @@
 // main.cjs (Electron 依存) と test-harness/cli/widget-protocol.mjs (Node CLI) の両方から
 // require される。electron モジュールへの依存や try/catch シムはここに置かない。
 
-const WIDGET_ID = "selfmatrix-native-prototype-call";
+// M2 readiness レビュー修正 (GPT 指摘 C/D): "prototype" 名の残りを剥がすため
+// "selfmatrix-native-prototype-call" から改名した。この値は cinny 側では一切参照されていない
+// (cinny 実体の NativeCallEmbed は自分自身の固定 widget id "call-embed" を使う — KNOWN_WIDGET_IDS の
+// コメント参照) ので、cinny 側の追随は不要 (整合を取るべき対象が存在しない)。この定数を使うのは
+// このリポジトリ自身の smoke/harness (合成の単体テスト用通話 URL) だけ。
+const WIDGET_ID = "selfmatrix-native-call";
 
 // validateCallViewUrl() の widgetId allow-list (M1 step 3c-1 受け入れレビュー修正)。
 // prototype 自身の合成 WIDGET_ID と、cinny CallEmbed が使う固定 widget id "call-embed" のみを
