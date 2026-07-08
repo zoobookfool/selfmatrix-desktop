@@ -2356,8 +2356,12 @@ async function main() {
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
     throw new Error(
       `Cinny dist not found: ${cinnyDist}\n` +
-        "Build it first: in a sibling '../cinny' checkout, run 'npm run build' (output goes to '../cinny/dist').\n" +
-        "Or point SELFMATRIX_CINNY_DIST at an existing build directory.",
+        // SelfMatrix M2: cinny の web ビルド (`npm run build`) は native シェル検出コードを
+        // tree-shake で除去するため、この native シェルと組み合わせるには
+        // `npm run build:native` (VITE_SELFMATRIX_NATIVE=true) でビルドした dist が必要
+        // (README.md 「開発手順」参照)。
+        "Build it first: in a sibling '../cinny' checkout, run 'npm run build:native' (output goes to '../cinny/dist'). Do NOT use plain 'npm run build' — it tree-shakes out the native bridge this shell requires.\n" +
+        "Or point SELFMATRIX_CINNY_DIST at an existing build:native output directory.",
     );
   }
   if (!fs.existsSync(path.join(ecDist, "index.html"))) {

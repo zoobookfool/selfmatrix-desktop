@@ -35,7 +35,9 @@ $env:SELFMATRIX_CINNY_DIST = "C:\path\to\cinny\dist"
 $env:SELFMATRIX_EC_DIST = "C:\path\to\element-call\dist"
 ```
 
-事前に cinny (`npm run build`) と element-call (`pnpm build:embedded`) をそれぞれのリポジトリでビルドしておくこと。dist が見つからない場合は、起動時にどちらのビルドが足りないかを示すエラーで落ちる (`../cinny/dist をビルドしてください` 相当の案内付き)。
+事前に cinny (`npm run build:native`) と element-call (`pnpm build:embedded`) をそれぞれのリポジトリでビルドしておくこと。dist が見つからない場合は、起動時にどちらのビルドが足りないかを示すエラーで落ちる (`../cinny/dist をビルドしてください` 相当の案内付き)。
+
+**cinny は必ず `npm run build:native` でビルドすること (`npm run build` ではない)。** SelfMatrix M2 で、cinny の web ビルド (`npm run build`) は native シェル検出コード (`window.selfmatrixNative` 検出、`src/app/plugins/call/native/**`) をセキュリティ対策として tree-shake で完全に除去するようになった (悪意ある拡張/サプライチェーン汚染が `window.selfmatrixNative` を植え込んでも web ビルドでは一切反応しない)。そのため通常の `npm run build` で作った cinny dist を配信すると、native シェル (このリポジトリ) が要求する `window.selfmatrixNative` 検出そのものが cinny 側に存在せず、**通話ホストが cinny-shell トポロジで成立しない** (`createCallEmbed()` が常に web 版 `CallEmbed` を返し、`WebContentsView` 経由の `NativeCallEmbed` に切り替わらない)。`npm run build:native` (`vite build --mode native`、`.env.native` の `VITE_SELFMATRIX_NATIVE=true` を読み込む) でビルドした dist だけがこのリポジトリと組み合わせて動作する。
 
 ```powershell
 npm install
