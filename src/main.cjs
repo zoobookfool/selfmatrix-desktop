@@ -46,6 +46,13 @@ const { resolveDisplayMediaSelection } = require("./source-picker-selection.cjs"
 const { verifyMinisign } = require("./minisign-verify.cjs");
 const { blake2b512, NATIVE_BLAKE2B512_AVAILABLE } = require("./minisign-blake2b.cjs");
 
+// M2 3b (electron-builder 同梱リソース化 + electron-updater 配線): design/release-pipeline.md §4/§7。
+// verifyUpdateCodeSignature (minisign 検証フック本体、既に §3a で実装済みだったが electron-updater
+// 未配線だったもの) と、その配線条件 (有効化/適用) を判定する Electron 非依存の純関数群。
+// 二重実装を避ける方針は他の *.cjs 純関数モジュールと同じ (widget-bridge-protocol.cjs 等参照)。
+const { verifyUpdateCodeSignature } = require("./update-signature-verify.cjs");
+const { shouldEnableAutoUpdater, shouldApplyUpdateNow } = require("./update-apply-gate.cjs");
+
 // F1 (受け入れレビュー修正): smoke がハンドシェイク完了後に注入する偽メッセージの action 名。
 // widgetId をわざと WIDGET_ID と不一致にしてあるので validateWidgetBridgeMessage の
 // widget_id_mismatch で必ず拒否される想定 — 拒否されなければ (＝すり抜ければ) smoke は fail する。
@@ -199,6 +206,15 @@ const isTrayProbe = process.argv.includes("--tray-probe");
 // 参照)。
 const isMinisignProbe = process.argv.includes("--minisign-probe");
 
+// M2 3b electron-updater 配線: --update-wiring-probe は「electron-updater の autoUpdater
+// シングルトンに verifyUpdateCodeSignature フック (update-signature-verify.cjs) と
+// allowDowngrade=false が実際に配線されていること」+「このプロセス (dev/unpacked、
+// app.isPackaged===false) では checkForUpdatesAndNotify() が一切呼ばれない (外部通信させない)
+// こと」を実測する専用モード。isMinisignProbe と同じ理由 (cinny/EC dist の存在確認や
+// ウィンドウ/HTTP サーバーの起動を必要としない) で main() の重いブート経路には乗せず独立に実行する
+// (下部の `if (app) {...}` 分岐、runUpdateWiringProbe() 参照)。
+const isUpdateWiringProbe = process.argv.includes("--update-wiring-probe");
+
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
 // smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
@@ -211,6 +227,16 @@ const isMinisignProbe = process.argv.includes("--minisign-probe");
 // + close-to-tray を有効化」した状態を検証するのがこのモードの目的そのものであるため。
 const isTestRunnerMode = isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
+
+// M2 3b electron-updater 配線: shouldEnableAutoUpdater() (update-apply-gate.cjs) の isTestMode
+// 引数に渡す「これはテスト/検証専用の起動か」の判定。isTestRunnerMode に加えて isTrayProbe/
+// isMinisignProbe/isUpdateWiringProbe も含める -- どのモードで実行しても
+// checkForUpdatesAndNotify() が外部 (GitHub Releases) へ通信することは絶対に無いようにする
+// (テストモードでは更新チェックを一切走らせない、というタスクの絶対条件)。実際には
+// app.isPackaged が dev 実行では常に false なので shouldEnableAutoUpdater() はこのフラグを見るまでも
+// なく false になるが、将来 dev ビルドを exe化して検証する変更が入っても二重に安全側へ倒すための
+// 明示ガード。
+const isUpdaterTestMode = isTestRunnerMode || isTrayProbe || isMinisignProbe || isUpdateWiringProbe;
 
 // 運用者指示 (2026-07-08「テストはできれば画面に出ないで欲しい」): E2E (--e2e-real-join) 実行中は
 // mainWindow/callWindow を「実ウィンドウのまま画面外座標」に開く。
@@ -391,6 +417,13 @@ const state = {
   // 適用履歴 (E2E/診断用、__selfmatrixE2E snapshot に載せる)。無制限に増え続けないよう
   // applyCallViewBoundsFromCinny() 側で上限を設けてトリムする。
   callViewBoundsApplyLog: [],
+  // M2 3b electron-updater 配線: autoUpdater の 'update-downloaded' が発火済みかどうか
+  // (setupAutoUpdater()/maybeApplyPendingUpdate() 参照)。ダウンロード + minisign 検証まで完了して
+  // いても、通話中はこのフラグが true になるだけで quitAndInstall() は呼ばれない。
+  updateReady: false,
+  // M2 3b electron-updater 配線: maybeCheckForUpdates() が実際に有効化条件を満たしたかどうかの
+  // 診断用スナップショット (--update-wiring-probe / evidence 用)。
+  autoUpdaterEnabled: false,
 };
 
 // M2 bounds sync: state.callViewBoundsApplyLog の保持上限 (evidence/メモリの肥大化防止。
@@ -416,8 +449,26 @@ if (app) {
 // per-machine home directory layout -- this repo is public and must not
 // assume a particular developer's folder structure. Set SELFMATRIX_CINNY_DIST
 // / SELFMATRIX_EC_DIST to override (absolute or relative to cwd).
+//
+// M2 3b (electron-builder 同梱リソース化): 上の sibling 解決は **dev/E2E 限定** (app.isPackaged
+// === false のときだけ)。製品パッケージ (electron-builder --dir/--win で作った exe、
+// app.isPackaged === true) では兄弟ディレクトリ自体が存在しない (README の sibling checkout は
+// 開発者のワークスペース構成であり、配布物には含まれない) ため、代わりに electron-builder.yml の
+// extraResources が process.resourcesPath 直下に平積みした同梱リソース
+// (`<resourcesPath>/cinny-dist`, `<resourcesPath>/ec-dist` -- electron-builder.yml の
+// extraResources.to 参照) を見る。dev 分岐の判定式・既定パス・SELFMATRIX_*_DIST 環境変数による
+// 上書きはどちらのモードでも一切変更していない (dev/E2E の挙動を壊さないことがこのタスクの
+// 絶対条件)。
+const PACKAGED_ARTIFACT_DIR_NAMES = Object.freeze({
+  SELFMATRIX_CINNY_DIST: "cinny-dist",
+  SELFMATRIX_EC_DIST: "ec-dist",
+});
+
 function resolveArtifact(envName, relativeParts) {
   if (process.env[envName]) return path.resolve(process.env[envName]);
+  if (app && app.isPackaged) {
+    return path.join(process.resourcesPath, PACKAGED_ARTIFACT_DIR_NAMES[envName]);
+  }
   return path.resolve(appRoot, "..", ...relativeParts);
 }
 
@@ -878,6 +929,88 @@ function quitFromTray() {
   app.quit();
 }
 
+// M2 3b electron-updater 配線 (design/release-pipeline.md §4/§7)。
+//
+// 「通話中」の定義: state.callViewState !== "none"。call view が存在する (attached/detached
+// いずれか -- attachCallView()/detachCallView() のどちらでも通話自体は継続中) 限り true。
+// closeCallView() が通話終了時に必ず state.callViewState = "none" を設定する (同関数末尾参照)。
+function isCallActive() {
+  return state.callViewState !== "none";
+}
+
+// electron-updater の autoUpdater シングルトンを実際に構築するのはこの関数を呼んだときだけ
+// (require("electron-updater") 自体は他の Electron 依存 require と同じくモジュール先頭で行っても
+// 副作用は無いが、初期化 (イベントリスナー登録・フック代入) は明示的にこの関数へまとめておく方が
+// --update-wiring-probe から「まだ何も配線されていない状態」と「配線済みの状態」を作り分けやすい)。
+// main() (本番/smoke/tray-probe 等の通常経路) と runUpdateWiringProbe() の両方から呼ばれる。
+let autoUpdaterInstance = null;
+
+function setupAutoUpdater() {
+  const { autoUpdater } = require("electron-updater");
+  // allowDowngrade 無効 (design/release-pipeline.md §4): 古い改造版へのダウングレード誘導を防ぐ。
+  autoUpdater.allowDowngrade = false;
+  // Authenticode コード署名をしない方針 (§1/§8) のため、既定の Windows 発行者証明書検証の代わりに
+  // installer 本体への minisign 署名検証をここに差す (§4 のフロー、update-signature-verify.cjs)。
+  // publisherName 引数は verifyUpdateCodeSignature 内部で使わない (関数コメント参照)。
+  autoUpdater.verifyUpdateCodeSignature = verifyUpdateCodeSignature;
+  // ダウンロード + (上の verifyUpdateCodeSignature による) 検証まで完了したら準備完了フラグを立てる
+  // だけで、ここでは quitAndInstall() を呼ばない -- 実際に適用してよいかは
+  // maybeApplyPendingUpdate() が通話中かどうかを見てから判断する (§7 の核心)。
+  autoUpdater.on("update-downloaded", () => {
+    state.updateReady = true;
+    maybeApplyPendingUpdate();
+  });
+  autoUpdaterInstance = autoUpdater;
+  return autoUpdater;
+}
+
+// 通話が終了した (closeCallView()) タイミング、および update-downloaded イベントの両方から呼ばれる。
+// 「ダウンロード済みの更新があり、かつ今は通話中でない」ときだけ実際に quitAndInstall() する
+// (design/release-pipeline.md §7: 通話中は quitAndInstall を呼ばない → 通話終了後 or 次回起動時に
+// 適用)。次回起動時の適用は electron-updater の既定 (autoInstallOnAppQuit) が自然なアプリ終了時に
+// カバーする -- ここで明示的に扱うのは「通話が終わった直後に、ユーザーを煩わせず自動で再起動して
+// 適用する」攻めのケースだけ。判定ロジック自体は shouldApplyUpdateNow() (update-apply-gate.cjs、
+// Electron 非依存の純関数、--update-wiring-probe と probe:update-apply-gate の両方で全分岐検証済み)
+// に委譲し、ここでは実際の quitAndInstall() 呼び出しという副作用だけを持つ。
+function maybeApplyPendingUpdate() {
+  if (!autoUpdaterInstance) return false;
+  const enabled = shouldEnableAutoUpdater({
+    isPackaged: Boolean(app.isPackaged),
+    isCinnyShell,
+    isTestMode: isUpdaterTestMode,
+  });
+  const apply = shouldApplyUpdateNow({
+    enabled,
+    updateReady: Boolean(state.updateReady),
+    callActive: isCallActive(),
+  });
+  if (apply) autoUpdaterInstance.quitAndInstall();
+  return apply;
+}
+
+// 起動時に一度だけ呼ばれる (main() 参照)。有効化条件 (本番パッケージ + 本番トポロジ + テスト/probe
+// モードでない) を満たすときだけ実際に checkForUpdatesAndNotify() を呼ぶ -- dev (unpacked)・
+// smoke/memory/cinny-shell-smoke・E2E・harness・tray-probe・minisign-probe・
+// update-wiring-probe のどれで実行しても app.isPackaged は false (または isUpdaterTestMode が
+// true) になるため、これらの経路では GitHub Releases への通信は一切発生しない。
+function maybeCheckForUpdates() {
+  const enabled = shouldEnableAutoUpdater({
+    isPackaged: Boolean(app.isPackaged),
+    isCinnyShell,
+    isTestMode: isUpdaterTestMode,
+  });
+  state.autoUpdaterEnabled = enabled;
+  if (!enabled || !autoUpdaterInstance) return false;
+  autoUpdaterInstance.checkForUpdatesAndNotify().catch((error) => {
+    state.widgetMessages.push({
+      t: Date.now(),
+      type: "auto-update-check-error",
+      error: String(error && error.message ? error.message : error),
+    });
+  });
+  return true;
+}
+
 // M2 自動起動 (opt-in、既定 OFF): Windows のスタートアップ登録は app.setLoginItemSettings() が
 // 実際にレジストリ (Run キー相当) へ書き込む。**このプロセス自身が読み書きするのは、ユーザーが
 // トレイメニューのチェック項目を実際にクリックしたときだけ** -- 起動時に自動で有効化する経路は
@@ -1194,6 +1327,11 @@ async function closeCallView() {
   state.callView = null;
   state.callViewState = "none";
   state.activeWidgetId = null;
+  // M2 3b electron-updater 配線 (design/release-pipeline.md §7): 通話が終わった直後に、ダウンロード
+  // 済みの更新があれば適用する (無ければ maybeApplyPendingUpdate() 内の shouldApplyUpdateNow() が
+  // false を返すだけの no-op)。isCallActive() は state.callViewState を見るため、この代入の直後で
+  // なければならない (通話中判定が正しく "非アクティブ" に切り替わった後で呼ぶ必要がある)。
+  maybeApplyPendingUpdate();
 }
 
 function updateCallViewBounds() {
@@ -3220,19 +3358,34 @@ async function main() {
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
     throw new Error(
       `Cinny dist not found: ${cinnyDist}\n` +
-        // SelfMatrix M2: cinny の web ビルド (`npm run build`) は native シェル検出コードを
-        // tree-shake で除去するため、この native シェルと組み合わせるには
-        // `npm run build:native` (VITE_SELFMATRIX_NATIVE=true) でビルドした dist が必要
-        // (README.md 「開発手順」参照)。
-        "Build it first: in a sibling '../cinny' checkout, run 'npm run build:native' (output goes to '../cinny/dist'). Do NOT use plain 'npm run build' — it tree-shakes out the native bridge this shell requires.\n" +
-        "Or point SELFMATRIX_CINNY_DIST at an existing build:native output directory.",
+        (app.isPackaged
+          ? // M2 3b: 製品パッケージでこのエラーに到達するのは electron-builder.yml の
+            // extraResources (cinny の `../cinny/dist` -> `resources/cinny-dist`) が正しく
+            // 同梱されなかった場合のみ (パッケージングの不備) -- 開発者向けの sibling checkout
+            // 案内は製品パッケージには存在しない `../cinny` を指すため無意味であり、代わりに
+            // パッケージング側の問題であることが分かる文言にする。
+            "This is a packaged build (app.isPackaged=true) — the bundled cinny dist is missing or corrupt. " +
+              "Rebuild with electron-builder after ensuring a sibling '../cinny' checkout has a fresh " +
+              "'npm run build:native' output (electron-builder.yml extraResources copies '../cinny/dist' to " +
+              "'resources/cinny-dist' at package time)."
+          : // SelfMatrix M2: cinny の web ビルド (`npm run build`) は native シェル検出コードを
+            // tree-shake で除去するため、この native シェルと組み合わせるには
+            // `npm run build:native` (VITE_SELFMATRIX_NATIVE=true) でビルドした dist が必要
+            // (README.md 「開発手順」参照)。
+            "Build it first: in a sibling '../cinny' checkout, run 'npm run build:native' (output goes to '../cinny/dist'). Do NOT use plain 'npm run build' — it tree-shakes out the native bridge this shell requires.\n" +
+              "Or point SELFMATRIX_CINNY_DIST at an existing build:native output directory."),
     );
   }
   if (!fs.existsSync(path.join(ecDist, "index.html"))) {
     throw new Error(
       `Element Call dist not found: ${ecDist}\n` +
-        "Build it first: in a sibling '../element-call' checkout, run 'pnpm build:embedded' (output goes to '../element-call/dist').\n" +
-        "Or point SELFMATRIX_EC_DIST at an existing build directory.",
+        (app.isPackaged
+          ? "This is a packaged build (app.isPackaged=true) — the bundled Element Call dist is missing or " +
+              "corrupt. Rebuild with electron-builder after ensuring a sibling '../element-call' checkout has a " +
+              "fresh 'pnpm build:embedded' output (electron-builder.yml extraResources copies " +
+              "'../element-call/dist' to 'resources/ec-dist' at package time)."
+          : "Build it first: in a sibling '../element-call' checkout, run 'pnpm build:embedded' (output goes to '../element-call/dist').\n" +
+              "Or point SELFMATRIX_EC_DIST at an existing build directory."),
     );
   }
 
@@ -3246,6 +3399,13 @@ async function main() {
   // テスト/E2E モード (isSmoke/isMemoryProbe/isCinnyShellSmoke/isE2ERealJoin/isHarness) では
   // 呼ばれない (trayEnabled の定義参照)。
   if (trayEnabled) createTray();
+  // M2 3b electron-updater 配線: フックの配線自体 (verifyUpdateCodeSignature/allowDowngrade の
+  // 代入、update-downloaded リスナー登録) はネットワークに一切触れないため、どのモードで起動しても
+  // 無条件に行う。実際に外部 (GitHub Releases) へ問い合わせる checkForUpdatesAndNotify() は
+  // maybeCheckForUpdates() 内部の shouldEnableAutoUpdater() が判定し、本番パッケージ + 本番トポロジ
+  // + テスト/probe モードでない場合だけ呼ばれる (isUpdaterTestMode の定義箇所参照)。
+  setupAutoUpdater();
+  maybeCheckForUpdates();
   if (isSmoke) await runSmoke();
   if (isMemoryProbe) await runMemoryProbe();
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
@@ -3259,15 +3419,125 @@ function evidenceFileForMode() {
   return "smoke-result.json";
 }
 
+// M2 3b electron-updater 配線: --update-wiring-probe 専用モード。isMinisignProbe と同じ理由で
+// main() の重いブート経路 (cinny/EC dist 存在確認・HTTP サーバー・ウィンドウ生成) を経由しない。
+//
+// 検証する内容:
+//   1. setupAutoUpdater() が実際の (require("electron-updater") で得られる) autoUpdater
+//      シングルトンへ verifyUpdateCodeSignature (update-signature-verify.cjs と同一の関数参照) と
+//      allowDowngrade=false を代入すること。
+//   2. このプロセス自身は dev/unpacked 実行 (app.isPackaged===false) であり、
+//      isUpdaterTestMode も true (--update-wiring-probe 自体が isUpdaterTestMode に含まれる) なので
+//      maybeCheckForUpdates() を呼んでも checkForUpdatesAndNotify() が実際には一切呼ばれない
+//      (外部通信させない) こと -- autoUpdater.checkForUpdatesAndNotify をスパイに差し替えて実測する。
+//   3. shouldEnableAutoUpdater()/shouldApplyUpdateNow() (update-apply-gate.cjs) の主要な分岐
+//      (本番パッケージ+本番トポロジ+非テストのときだけ有効化される、通話中は適用しない等) を、
+//      このプロセスでは作れない app.isPackaged===true のケースも含めて合成入力で検証する
+//      (全分岐の網羅は probe:update-apply-gate 側、ここでは配線が実際にこの純関数を使っている
+//      ことの統合的な確認に絞る)。
+async function runUpdateWiringProbe() {
+  await app.whenReady();
+
+  const autoUpdater = setupAutoUpdater();
+
+  // 実 electron-updater 実装 (ネットワークへ問い合わせる) は決して呼ばない (外部通信させない
+  // 絶対条件) -- スパイに差し替え、呼ばれてはならない経路をこの probe が実際に踏んだかどうかだけを
+  // 記録する no-op にする。
+  let checkForUpdatesAndNotifyCalled = false;
+  autoUpdater.checkForUpdatesAndNotify = () => {
+    checkForUpdatesAndNotifyCalled = true;
+    return Promise.resolve(null);
+  };
+
+  const calledForThisProcess = maybeCheckForUpdates();
+
+  const hookWiring = {
+    verifyUpdateCodeSignatureIsOurs: autoUpdater.verifyUpdateCodeSignature === verifyUpdateCodeSignature,
+    allowDowngradeFalse: autoUpdater.allowDowngrade === false,
+  };
+  hookWiring.pass = hookWiring.verifyUpdateCodeSignatureIsOurs && hookWiring.allowDowngradeFalse;
+
+  const noNetworkCallInTestMode = {
+    isPackaged: Boolean(app.isPackaged),
+    isUpdaterTestMode,
+    autoUpdaterEnabled: state.autoUpdaterEnabled,
+    maybeCheckForUpdatesReturnedFalse: calledForThisProcess === false,
+    checkForUpdatesAndNotifyCalled,
+    pass:
+      state.autoUpdaterEnabled === false &&
+      calledForThisProcess === false &&
+      checkForUpdatesAndNotifyCalled === false,
+  };
+
+  // 合成入力での分岐検証 (このプロセス自身の app.isPackaged は常に false だが、
+  // shouldEnableAutoUpdater()/shouldApplyUpdateNow() は Electron 非依存の純関数なので
+  // 実行環境と無関係に全分岐を検証できる -- probe:update-apply-gate と重複するが、「main.cjs が
+  // 実際にこの関数を正しい引数で使っている」ことまで確認する意図で意図的に薄く再掲する)。
+  const gateMatrix = [
+    { isPackaged: true, isCinnyShell: true, isTestMode: false, expectEnabled: true },
+    { isPackaged: false, isCinnyShell: true, isTestMode: false, expectEnabled: false },
+    { isPackaged: true, isCinnyShell: false, isTestMode: false, expectEnabled: false },
+    { isPackaged: true, isCinnyShell: true, isTestMode: true, expectEnabled: false },
+  ].map((testCase) => {
+    const enabled = shouldEnableAutoUpdater(testCase);
+    return { ...testCase, enabled, pass: enabled === testCase.expectEnabled };
+  });
+  const gateMatrixPass = gateMatrix.every((entry) => entry.pass);
+
+  const applyMatrix = [
+    { enabled: true, updateReady: true, callActive: false, expectApply: true },
+    { enabled: true, updateReady: true, callActive: true, expectApply: false },
+    { enabled: true, updateReady: false, callActive: false, expectApply: false },
+    { enabled: false, updateReady: true, callActive: false, expectApply: false },
+  ].map((testCase) => {
+    const apply = shouldApplyUpdateNow(testCase);
+    return { ...testCase, apply, pass: apply === testCase.expectApply };
+  });
+  const applyMatrixPass = applyMatrix.every((entry) => entry.pass);
+
+  const result = {
+    pass: hookWiring.pass && noNetworkCallInTestMode.pass && gateMatrixPass && applyMatrixPass,
+    hookWiring,
+    noNetworkCallInTestMode,
+    gateMatrix,
+    applyMatrix,
+    electron: process.versions.electron,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "update-wiring-probe-result.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[update-wiring-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
+
+  app.exit(result.pass ? 0 : 1);
+}
+
 if (app) {
-  // --minisign-probe は main() の重いブート経路 (cinny/EC dist 存在確認・HTTP サーバー・
-  // ウィンドウ生成) を必要としない (runMinisignProbe() のコメント参照) ため、main() を経由せず
-  // 独立に起動する。
+  // --minisign-probe / --update-wiring-probe は main() の重いブート経路 (cinny/EC dist 存在確認・
+  // HTTP サーバー・ウィンドウ生成) を必要としない (各 run*Probe() 冒頭のコメント参照) ため、main() を
+  // 経由せず独立に起動する。
   if (isMinisignProbe) {
     runMinisignProbe().catch((error) => {
       fs.mkdirSync(evidenceDir, { recursive: true });
       fs.writeFileSync(
         path.join(evidenceDir, "minisign-electron-probe-result.json"),
+        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+        "utf8",
+      );
+      console.error(error);
+      app.exit(1);
+    });
+  } else if (isUpdateWiringProbe) {
+    runUpdateWiringProbe().catch((error) => {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(evidenceDir, "update-wiring-probe-result.json"),
         `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
         "utf8",
       );

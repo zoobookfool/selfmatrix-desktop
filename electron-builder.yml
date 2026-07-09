@@ -1,0 +1,82 @@
+# electron-builder 設定 (M2 3b)。正本は selfmatrix-workspace の design/release-pipeline.md §2。
+#
+# 対応 OS は Windows のみ (§1)。target は NSIS。Authenticode コード署名はしない
+# (個人には高コスト / Azure Trusted Signing は日本の個人は不可 -- §1、§8 で SmartScreen 案内)。
+# 配布物の完全性は Artifact Attestation + SHA256SUMS + minisign 署名 (§3) で担保する。
+
+appId: win.selfmatrix.desktop
+productName: SelfMatrix
+copyright: "SelfMatrix contributors"
+
+directories:
+  # 既定の "dist" のまま (package:dir / package:win の出力は dist/win-unpacked/, dist/*.exe)。
+  output: dist
+
+# asar: false (意図的な選択、要実装時確認の結論):
+#   1. main.cjs は自分自身の evidence/*.json を `path.resolve(__dirname, "..")` 相対の
+#      "evidence/" ディレクトリへ fs.writeFileSync() で書き出す (smoke/probe 系モード、および
+#      --update-wiring-probe)。asar 化すると __dirname が app.asar (読み取り専用の仮想 FS) 内を
+#      指すことになり、__dirname から親を辿った "evidence/" もその読み取り専用アーカイブの外へ
+#      正しく解決できない (書き込み自体が失敗する)。
+#   2. session.fromPartition(...).registerPreloadScript({ filePath: ... }) や BrowserWindow の
+#      preload オプションは asar 内パスでも Electron 標準機能として動作するが、cinny/EC の HTTP
+#      配信 (内蔵 http サーバーが fs.createReadStream() で .wasm 等の大きめの静的アセットを
+#      ストリーム配信する) を asar 越しに行うことの相性は未検証。cinny/EC dist は同梱リソース
+#      (extraResources、下記) 側で既に asar の外に置く方針にしているため、アプリ本体側
+#      (src/**, resources/cinny-config.production.json) も同じ「素のファイルとして展開する」
+#      方針に揃え、検証済みでない挙動 (asar 越しの大容量ストリーム配信) を作らないようにした。
+# 上記の理由により、パッケージはやや大きくなるが (asar 圧縮なし)、正しさ・検証容易性を優先する。
+asar: false
+
+files:
+  - "**/*"
+  - "!e2e${/*}"
+  - "!evidence${/*}"
+  - "!README.md"
+  - "!LICENSE"
+  - "!*.log"
+  - "!.gitignore"
+  - "!electron-builder.yml"
+
+# 同梱リソース (extraResources): cinny (native ビルド) / Element Call (embedded ビルド) の dist を
+# process.resourcesPath 直下 (asar の外) に平積みする。main.cjs の resolveArtifact() は
+# app.isPackaged === true のときこの 2 ディレクトリを参照する (sibling ../cinny/dist,
+# ../element-call/dist を見る dev 経路とは完全に分離している -- resolveArtifact() のコメント参照)。
+#
+# from はこのリポジトリの README「開発手順」が前提とする sibling checkout レイアウトに合わせた
+# 相対パス。CI/ローカルどちらでも `<workspace root>/{cinny,element-call,selfmatrix-desktop}` の
+# 配置であれば追加設定なしで解決する。cinny は必ず `npm run build:native` (web 版 `npm run build`
+# ではない -- README「開発手順」参照) でビルド済みの dist を置いておくこと。
+extraResources:
+  - from: ../cinny/dist
+    to: cinny-dist
+    # dev 用 config.json (synapse.m.localhost 等のローカルスタック向き先) は同梱しない。
+    # 製品では /config.json を resources/app の cinny-config.production.json (matrix.org のみ)
+    # で分岐配信する (main.cjs resolveCinnyConfigPath) ため、cinny-dist 側の config.json は
+    # 製品では一切読まれない。公開ビルドのバイナリに dev サーバー名を残さないため除外する。
+    filter:
+      - "**/*"
+      - "!config.json"
+  - from: ../element-call/dist
+    to: ec-dist
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "${productName}-Setup-${version}.${ext}"
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  artifactName: "${productName}-Setup-${version}.${ext}"
+
+# CI (design/release-pipeline.md §6) がドラフトリリースへ成果物をアップロードする先。署名は
+# CI に入れない (秘密鍵は運用者の手元のみ、§5) -- publish はここでは経路の宣言のみで、実際の
+# `electron-builder --publish` 呼び出しは本タスクのスコープ外 (CI 実装は別タスク)。
+publish:
+  provider: github
+  owner: zoobookfool
+  repo: selfmatrix-desktop
