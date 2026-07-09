@@ -4,7 +4,8 @@ try {
 } catch (error) {
   if (require.main === module) throw error;
 }
-const { app, BrowserWindow, WebContentsView, desktopCapturer, ipcMain, session, shell } = electron;
+const { app, BrowserWindow, WebContentsView, desktopCapturer, ipcMain, session, shell, Tray, Menu, nativeImage } =
+  electron;
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
@@ -143,6 +144,25 @@ if (isE2ERealJoin && app) {
   app.commandLine.appendSwitch("host-resolver-rules", "MAP *.m.localhost 127.0.0.1");
 }
 
+// M2 トレイ常駐: OS のトレイの実クリックは自動化できないため、--tray-probe はトレイ関連ロジック
+// (生成/close-to-tray/メニュー/クリックハンドラ) をプログラム的に検証する専用モード。本番相当
+// (トレイ生成 + close-to-tray 有効) で起動し、runTrayProbe() が各挙動を直接呼んで
+// evidence/tray-probe-result.json に記録する。
+const isTrayProbe = process.argv.includes("--tray-probe");
+
+// M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
+// 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
+// smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
+// ライフサイクルを自己管理しており、E2E (--e2e-real-join) は Playwright の
+// electronApp.close() がウィンドウを普通に閉じて window-all-closed 経由の app.quit() で終了する
+// 前提で書かれている。close-to-tray (close イベントを preventDefault してウィンドウを隠すだけに
+// する) を有効にしたままだと、これらのテストランナーが「ウィンドウを閉じればプロセスが終わる」と
+// 期待している契約を壊してしまう。--harness も同じ理由で検証専用モードとして対象外にする。
+// --tray-probe はこの一覧に入れず、`isTrayProbe ||` で明示的に有効化する — 「本番相当でトレイ生成
+// + close-to-tray を有効化」した状態を検証するのがこのモードの目的そのものであるため。
+const isTestRunnerMode = isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness;
+const trayEnabled = isTrayProbe || !isTestRunnerMode;
+
 // 運用者指示 (2026-07-08「テストはできれば画面に出ないで欲しい」): E2E (--e2e-real-join) 実行中は
 // mainWindow/callWindow を「実ウィンドウのまま画面外座標」に開く。
 //
@@ -169,7 +189,9 @@ const E2E_OFFSCREEN_WINDOW_POSITION = Object.freeze({ x: -4000, y: 100 });
 // 可視のままだった。show:false での非表示化はコンポジタ挙動が変わりメモリ計測の意味がズレるため、
 // E2E と同じ「実ウィンドウのまま画面外」で揃える。
 function e2eOffscreenBrowserWindowOptions() {
-  if (!isE2ERealJoin && !isMemoryProbe) return {};
+  // M2 トレイ常駐: tray-probe も「テストは画面に出ないで欲しい」の対象に加える。close-to-tray の
+  // 実測 (win.isVisible() の遷移) は画面外配置でも変わらず検証できる (E2E/memory-probe と同じ理由)。
+  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe) return {};
   return { x: E2E_OFFSCREEN_WINDOW_POSITION.x, y: E2E_OFFSCREEN_WINDOW_POSITION.y };
 }
 
@@ -231,6 +253,9 @@ const state = {
   origin: null,
   server: null,
   mainWindow: null,
+  // M2 トレイ常駐: trayEnabled のときだけ createTray() が設定する。テスト/E2E モードでは
+  // ずっと null のまま (createTray() 自体が呼ばれない、main() 参照)。
+  tray: null,
   callWindow: null,
   callView: null,
   callViewState: "none",
@@ -274,7 +299,13 @@ const CALL_VIEW_BOUNDS_LOG_LIMIT = 200;
 
 if (app) {
   app.on("window-all-closed", () => {
-    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke) app.quit();
+    // M2 トレイ常駐: tray-probe もここに加える。runTrayProbe() は意図的に mainWindow.close() を
+    // 呼んで close-to-tray の挙動を実測する (preventDefault() が外れる変異が入ると、この close()
+    // は本当にウィンドウを破棄してしまう)。ここで app.quit() してしまうと、evidence を書き出す前に
+    // プロセスごと終了してしまい、変異を「検知して FAIL を記録する」ことができなくなる —
+    // 他の run*() 系モードと同じく、tray-probe も自分の run 関数 (runTrayProbe()) の末尾で
+    // app.exit() を明示的に呼んでライフサイクルを自己管理する。
+    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe) app.quit();
   });
 }
 
@@ -520,6 +551,22 @@ function createMainWindow() {
   state.mainWindow = win;
   win.on("resize", updateCallViewBounds);
 
+  // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
+  // trayEnabled (本番起動、または --tray-probe) のときだけ close イベントを横取りする。
+  // app.isQuitting (トレイメニュー「終了」= quitFromTray() が立てる) が既に true のときだけ
+  // 本当に閉じさせ、それ以外は preventDefault() してウィンドウを隠すだけに留める。
+  // window-all-closed 側 (上の app.on("window-all-closed", ...) 参照、isTrayProbe を含む各
+  // テスト/probe モードでしか app.quit() しない) と対で、トレイ常駐中はウィンドウが 0 枚でも
+  // プロセスが生存し続ける。テスト/E2E モード (trayEnabled===false) ではこのリスナー自体を
+  // 登録しないため、close は従来どおり普通にウィンドウを破棄する。
+  if (trayEnabled) {
+    win.on("close", (event) => {
+      if (app.isQuitting) return;
+      event.preventDefault();
+      win.hide();
+    });
+  }
+
   // C3 (Fable レビュー #2, セキュリティ修正): mainWindow は cinny (または harness) をホストし、
   // 強力な window.selfmatrixNative bridge (shell-preload.cjs) を持つ。call view には G7
   // (createCallViewIfNeeded() 参照) でナビゲーション封じ込めを付けていたが、mainWindow には
@@ -604,6 +651,85 @@ function createCallWindow() {
   });
   state.callWindow = win;
   return win;
+}
+
+// M2 トレイ常駐 (Discord 風: 閉じるボタン = トレイに最小化、終了はトレイメニューから、右クリックで
+// メニュー)。この一群はトレイ本体・アイコン・メニュー・クリック挙動を扱う。有効化は trayEnabled
+// (本番起動、または --tray-probe) のときだけ -- main() の呼び出し箇所参照。
+
+// ブランドアイコンは UI/デザイン工程 (後で GPT/人) が用意する想定の**差し替え前提プレースホルダ**。
+// PNG ファイルを新規に追加する代わりに nativeImage.createFromBitmap() で生ビットマップ (BGRA、
+// ヘッダ/メタデータなし) を直接組み立てる — ファイル資産にすると出自や埋め込みメタデータ (Exif 等)
+// の心配が生じるが、この方式はメタデータという概念自体が存在しないため個人情報混入の余地が無い。
+// 16x16 の単色円 (自作の簡易図形、他所の素材の流用ではない)。alpha は 0 か 255 のみを使うため、
+// premultiplied/straight どちらの解釈でも見え方が変わらない。
+function createPlaceholderTrayIcon() {
+  const size = 16;
+  const buffer = Buffer.alloc(size * size * 4);
+  const center = (size - 1) / 2;
+  const radius = size / 2 - 1;
+  // BGRA の各バイト (nativeImage.createFromBitmap() が要求するネイティブ内部フォーマット)。
+  // 色そのものに意味は無い — 最終的なブランドアイコンで必ず差し替わる想定のプレースホルダ。
+  const blue = 0xc8;
+  const green = 0x6a;
+  const red = 0x5a;
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const dx = x - center;
+      const dy = y - center;
+      const inside = dx * dx + dy * dy <= radius * radius;
+      const offset = (y * size + x) * 4;
+      buffer[offset] = blue;
+      buffer[offset + 1] = green;
+      buffer[offset + 2] = red;
+      buffer[offset + 3] = inside ? 0xff : 0x00;
+    }
+  }
+  return nativeImage.createFromBitmap(buffer, { width: size, height: size });
+}
+
+// トレイの左クリック/ダブルクリック挙動 (Discord 準拠: クリックでウィンドウを前面化するだけ、
+// トグルにはしない — トグルだと「クリックしたら隠れた」という事故が起きやすいため)。
+// tray.on("click"/"double-click", ...) と runTrayProbe() の両方から同じ関数参照を呼べるよう、
+// named function として切り出してある (「tray の click ハンドラを直接呼ぶ」検証に使う)。
+function handleTrayActivate() {
+  const win = state.mainWindow;
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+// トレイメニュー「終了」の実体。close-to-tray (createMainWindow() の close ハンドラ) は
+// app.isQuitting が立っていない限り preventDefault() + hide() するだけなので、本当に終了する
+// ときはここで先にフラグを立ててから app.quit() する。
+function quitFromTray() {
+  app.isQuitting = true;
+  app.quit();
+}
+
+// トレイの右クリックメニュー定義。「将来ミュート制御等を足せる構造にしておく」という要件どおり、
+// 項目は配列で持つ (増やす場合はこの配列に追記するだけでよい)。状態を持たない純関数として書いて
+// あるので、createTray() が実際にトレイへ設定するのと runTrayProbe() が検証用に取得するのとで
+// 常に同じ定義になる。
+function trayMenuTemplate() {
+  return [
+    { label: "SelfMatrix を開く", click: () => handleTrayActivate() },
+    { type: "separator" },
+    { label: "終了", click: () => quitFromTray() },
+  ];
+}
+
+function createTray() {
+  const tray = new Tray(createPlaceholderTrayIcon());
+  tray.setToolTip("SelfMatrix");
+  tray.setContextMenu(Menu.buildFromTemplate(trayMenuTemplate()));
+  tray.on("click", handleTrayActivate);
+  // Windows は 1 回のクリックで "click"、素早い連続クリックで追加の "double-click" も発火する。
+  // どちらも同じ「前面化するだけ」の挙動にする (Discord と同様)。
+  tray.on("double-click", handleTrayActivate);
+  state.tray = tray;
+  return tray;
 }
 
 // M1 step 3b: harness/smoke 用の既定 widget パラメータで完成 URL を組み立てる汎用ヘルパー。
@@ -2415,6 +2541,89 @@ function setupE2EIntrospection() {
   };
 }
 
+// M2 トレイ常駐の検証専用モード (--tray-probe)。OS のトレイの実クリック/右クリックは自動化
+// できないため、ロジック本体 (close ハンドラ/トレイのクリックハンドラ/メニュー項目の click
+// ハンドラ) を main プロセス内から直接呼んで機械的に検証する。他の run*() と同じく、最後に
+// evidence を書いて app.exit() でライフサイクルを自己完結させる (window-all-closed からの
+// app.quit() はこのモードでは無効化してある — 上の app.on("window-all-closed", ...) のコメント
+// 参照)。
+async function runTrayProbe() {
+  const win = state.mainWindow;
+
+  const trayCreated = Boolean(state.tray) && !state.tray.isDestroyed();
+
+  // closeHidesWindow: 合成 emit ではなく本物の win.close() を呼ぶ。close ハンドラの
+  // event.preventDefault() が外れる変異が入った場合、この呼び出しは実際にウィンドウを破棄して
+  // しまう (window-all-closed も isTrayProbe を除外してあるので app.quit() は呼ばれず、この
+  // プロセス自体は生き残る — 「破棄されてしまった」という事実だけを検知して FAIL を記録できる)。
+  win.close();
+  await wait(200);
+  const closeHidesWindow = !win.isDestroyed() && win.isVisible() === false && app.isQuitting !== true;
+
+  // contextMenuItems: 実際にトレイへ設定したのと同じ定義 (trayMenuTemplate()、状態を持たない
+  // 純関数) をもう一度取得してラベル一覧を記録する。createTray() が使ったものと常に同じ形になる。
+  const menuTemplate = trayMenuTemplate();
+  const menuLabels = menuTemplate.map((item) => item.label ?? null);
+  const contextMenuItems = {
+    labels: menuLabels,
+    containsOpenLabel: menuLabels.some((label) => typeof label === "string" && label.includes("開く")),
+    containsQuitLabel: menuLabels.some((label) => typeof label === "string" && label.includes("終了")),
+  };
+
+  // trayClickShowsWindow: closeHidesWindow のステップで隠した (または壊れて破棄された)
+  // ウィンドウに対し、トレイの click ハンドラそのもの (tray.on("click", handleTrayActivate) と
+  // 全く同じ関数参照) を直接呼ぶ。破棄されている場合は win.isVisible() が例外を投げるため、
+  // 安全側に倒して false のまま記録する。
+  let trayClickShowsWindow = false;
+  if (!win.isDestroyed()) {
+    handleTrayActivate();
+    await wait(100);
+    trayClickShowsWindow = win.isVisible() === true;
+  }
+
+  // quitMenuReallyQuits: 「終了」メニュー項目の click ハンドラ (quitFromTray()) を直接呼ぶ。
+  // 実プロセスを本当に殺す前に「app.isQuitting フラグが立ったか」「app.quit() が呼ばれたか」を
+  // 確認したいので、app.quit() を一時的にスパイへ差し替えてから呼び、確認後に元へ戻す —
+  // このモード自身の終了は末尾の app.exit() が担う (本物の app.quit() を素通しすると、
+  // evidence を書き出す前にプロセスが終了しかねない)。
+  const originalQuit = app.quit.bind(app);
+  let quitWasCalled = false;
+  app.quit = () => {
+    quitWasCalled = true;
+  };
+  const quitItem = menuTemplate.find((item) => typeof item.label === "string" && item.label.includes("終了"));
+  quitItem.click();
+  app.quit = originalQuit;
+  const quitMenuReallyQuits = quitWasCalled && app.isQuitting === true;
+
+  const result = {
+    // 記録するフィールドは全て pass の論理積に使う (記録専用の飾りフィールドは作らない)。
+    pass:
+      trayCreated &&
+      closeHidesWindow &&
+      contextMenuItems.containsOpenLabel &&
+      contextMenuItems.containsQuitLabel &&
+      trayClickShowsWindow &&
+      quitMenuReallyQuits,
+    trayCreated,
+    closeHidesWindow,
+    contextMenuItems,
+    trayClickShowsWindow,
+    quitMenuReallyQuits,
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, "tray-probe-result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  state.tray?.destroy();
+  state.callWindow?.destroy();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
+  state.server?.close();
+  app.exit(result.pass ? 0 : 1);
+}
+
 async function main() {
   await app.whenReady();
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
@@ -2441,14 +2650,20 @@ async function main() {
   setupE2EIntrospection();
   await startServer();
   createMainWindow();
+  // M2 トレイ常駐: trayEnabled (本番起動、または --tray-probe) のときだけ生成する。
+  // テスト/E2E モード (isSmoke/isMemoryProbe/isCinnyShellSmoke/isE2ERealJoin/isHarness) では
+  // 呼ばれない (trayEnabled の定義参照)。
+  if (trayEnabled) createTray();
   if (isSmoke) await runSmoke();
   if (isMemoryProbe) await runMemoryProbe();
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
+  if (isTrayProbe) await runTrayProbe();
 }
 
 function evidenceFileForMode() {
   if (isCinnyShellSmoke) return "cinny-shell-result.json";
   if (isMemoryProbe) return "memory-result.json";
+  if (isTrayProbe) return "tray-probe-result.json";
   return "smoke-result.json";
 }
 

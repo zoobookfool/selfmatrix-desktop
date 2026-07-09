@@ -10,7 +10,7 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
 - **通話は iframe ではなく `WebContentsView`。** Element Call (ウィジェット専用ビルド `@element-hq/element-call-embedded` 相当の dist) を、cinny のウィンドウに `addChildView()` で重ねて表示する。cinny の実レイアウト (通話バーの位置・サイズ) に追従させるための bounds 同期も実装済み。
 - **契約 (プロトコル) の正本は cinny 側。** iframe が存在しないネイティブ環境で `matrix-widget-api` のハンドシェイクや call-control 操作を成立させるための契約 (`window.selfmatrixNative` / `NativeCallControlAction` など) は、cinny fork の [`src/app/plugins/call/native/nativeBridge.ts`](https://github.com/zoobookfool/selfmatrix-cinny) が定義する。このリポジトリの役割は、その契約が要求する **shell 側の実装** を提供することに限られる — 契約自体を変更する場合は cinny 側から始めること。
 - **shell 側の実装 (`src/`)**:
-  - `main.cjs` — Electron メインプロセス。cinny/EC の dist を配信するローカル HTTP サーバ、`BrowserWindow`/`WebContentsView` のライフサイクル、widget-api メッセージの素通し中継 (`native:widget-to-view` / `native:widget-from-view`)、call-control の correlationId 方式 RPC 中継、通話 URL の検証 (`openCallView`) を持つ。
+  - `main.cjs` — Electron メインプロセス。cinny/EC の dist を配信するローカル HTTP サーバ、`BrowserWindow`/`WebContentsView` のライフサイクル、widget-api メッセージの素通し中継 (`native:widget-to-view` / `native:widget-from-view`)、call-control の correlationId 方式 RPC 中継、通話 URL の検証 (`openCallView`) を持つ。本番起動時はトレイ常駐 (M2) も持つ — 閉じるボタンはトレイへの最小化に留め (`close` を `preventDefault()` して `hide()`)、終了はトレイの右クリックメニュー「終了」から (`app.isQuitting` フラグ経由)。トレイアイコンは差し替え前提のプレースホルダ (`nativeImage.createFromBitmap()` で自作生成、ファイル資産は追加していない)。テスト/E2E モード (`--smoke`/`--memory-probe`/`--cinny-shell-smoke`/`--e2e-real-join`/`--harness`) では無効化される。
   - `widget-bridge-protocol.cjs` — Electron に依存しない純関数群 (URL 検証・メッセージ検証)。`main.cjs` はここへ委譲するだけで、判定ロジックを二重実装しない。
   - `shell-preload.cjs` / `shell-widget-host.js` — cinny 側 (mainWindow) の preload と、本物の `ClientWidgetApi` を動かす通常スクリプト。`claimWidgetTransport()` が通話 1 本につき 1 回だけ払い出す transport オブジェクトが `window.selfmatrixNative` として cinny から見える。
   - `call-control-preload.cjs` — 通話 View (Element Call) 側の preload。screenshare/spotlight/emphasis/reactions/settings/sound の実 DOM 操作を担当し、host からは RPC 経由でのみ駆動される。
@@ -52,10 +52,12 @@ npm run harness       # harness モード (desktop-shell.html + cinny を iframe
 ### スモークテスト (バックエンド不要)
 
 ```powershell
-npm test              # smoke + memory + cinny-shell-smoke をまとめて実行
+npm test              # smoke + memory + cinny-shell-smoke + tray-probe をまとめて実行
 npm run smoke
 npm run memory
 npm run cinny-shell-smoke
+npm run tray-probe    # トレイ常駐 (M2)。OS の実クリックは自動化できないため、close-to-tray/
+                       # メニュー/クリックハンドラをプログラム的に検証する専用モード
 ```
 
 `npm test` は Electron の実起動を伴う (headless CI で xvfb 等の準備が無い環境では失敗する)。結果は `evidence/*.json` に出力されるが、このリポジトリでは `evidence/` は `.gitignore` 済み — コミットしない (下記「証跡の扱い」参照)。
