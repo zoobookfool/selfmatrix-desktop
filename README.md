@@ -9,6 +9,7 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
 - **トップフレームは cinny 本体。** ブラウザ版のような `<origin>/cinny/` 以下へのパスプレフィックスは無く、cinny の React Router がオリジンのルートを直接占有する (フラグ無しの通常起動が既定でこのトポロジになる。内部的には `--cinny-shell` と呼ぶ)。
 - **通話は iframe ではなく `WebContentsView`。** Element Call (ウィジェット専用ビルド `@element-hq/element-call-embedded` 相当の dist) を、cinny のウィンドウに `addChildView()` で重ねて表示する。cinny の実レイアウト (通話バーの位置・サイズ) に追従させるための bounds 同期も実装済み。
 - **契約 (プロトコル) の正本は cinny 側。** iframe が存在しないネイティブ環境で `matrix-widget-api` のハンドシェイクや call-control 操作を成立させるための契約 (`window.selfmatrixNative` / `NativeCallControlAction` など) は、cinny fork の [`src/app/plugins/call/native/nativeBridge.ts`](https://github.com/zoobookfool/selfmatrix-cinny) が定義する。このリポジトリの役割は、その契約が要求する **shell 側の実装** を提供することに限られる — 契約自体を変更する場合は cinny 側から始めること。
+- **自サーバーを焼き込まない (M2 homeserver 選択制)。** アプリは接続先ホームサーバーを固定しない — cinny の [`config.json`](https://github.com/zoobookfool/selfmatrix-cinny) が持つホームサーバー選択 UI をそのまま使い、ユーザーが接続先を手入力する。候補として提示するのは matrix.org (Matrix 公式) のみ。cinny リポジトリ自身の `config.json` はローカル dev バックエンド (synapse.m.localhost 等) 向けの開発専用設定であり製品では使えないため、このリポジトリが配信層で製品用の設定に差し替える (下記「ホームサーバー設定の配信」参照)。
 - **shell 側の実装 (`src/`)**:
   - `main.cjs` — Electron メインプロセス。cinny/EC の dist を配信するローカル HTTP サーバ、`BrowserWindow`/`WebContentsView` のライフサイクル、widget-api メッセージの素通し中継 (`native:widget-to-view` / `native:widget-from-view`)、call-control の correlationId 方式 RPC 中継、通話 URL の検証 (`openCallView`) を持つ。本番起動時はトレイ常駐 (M2) も持つ — 閉じるボタンはトレイへの最小化に留め (`close` を `preventDefault()` して `hide()`)、終了はトレイの右クリックメニュー「終了」から (`app.isQuitting` フラグ経由)。トレイアイコンは差し替え前提のプレースホルダ (`nativeImage.createFromBitmap()` で自作生成、ファイル資産は追加していない)。テスト/E2E モード (`--smoke`/`--memory-probe`/`--cinny-shell-smoke`/`--e2e-real-join`/`--harness`) では無効化される。
   - `widget-bridge-protocol.cjs` — Electron に依存しない純関数群 (URL 検証・メッセージ検証)。`main.cjs` はここへ委譲するだけで、判定ロジックを二重実装しない。
@@ -16,6 +17,18 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
   - `call-control-preload.cjs` — 通話 View (Element Call) 側の preload。screenshare/spotlight/emphasis/reactions/settings/sound の実 DOM 操作を担当し、host からは RPC 経由でのみ駆動される。
   - `desktop-shell.html` / `desktop-shell.js` — cinny を iframe として埋め込む harness モード (`--harness` を明示指定したとき、または `--smoke`/`--memory-probe` などバックエンド無しでの自動検証用に使う。本番トポロジ (既定の起動、`--cinny-shell` 相当) とは別)。
   - `system-audio-probe.cjs` / `app-audio-capture-probe.cjs` — システム音声 (loopback) キャプチャとアプリ単位音声キャプチャの実機確認用スタンドアロン Electron スクリプト (`npm test` には含まれない)。
+  - `resources/cinny-config.production.json` — 製品用の cinny `config.json` (下記「ホームサーバー設定の配信」参照)。
+
+## ホームサーバー設定の配信
+
+cinny 本体 (SPA) は `config.json` を常にオリジンルート相対 (`/config.json`) で fetch する。cinny/dist に同梱される `config.json` (cinny リポジトリ直下からコピーされたもの) はこのワークスペースのローカル dev バックエンド (`synapse.m.localhost` 等) 専用設定であり、製品でそのまま配信すると存在しない自サーバードメインがホームサーバー候補に残ってしまう。
+
+`main.cjs` の内蔵 HTTP サーバは `/config.json` へのリクエストをモードで出し分ける (`resolveCinnyConfigPath()`):
+
+- **E2E (`--e2e-real-join`)**: 従来どおり `cinny/dist/config.json` (dev 設定、synapse 向け) をそのまま返す。E2E はローカル dev バックエンドへの実ログインを検証するため必須。
+- **それ以外の全モード** (フラグ無しの通常起動、`--cinny-shell`、`--cinny-shell-smoke` 等): このリポジトリ内の `resources/cinny-config.production.json` を返す。ホームサーバー候補は `matrix.org` のみで自サーバードメインは一切含まない。`allowCustomHomeservers: true` によりユーザーは任意のサーバーを手入力できる (cinny の `ServerPicker` UI、`allowCustomHomeservers` は cinny の `ClientConfig` 型 [`useClientConfig.ts`](https://github.com/zoobookfool/selfmatrix-cinny/blob/product/discord-style-shell/src/app/hooks/useClientConfig.ts) 準拠)。
+
+`cinny/dist/config.json` 自体はこのリポジトリからは一切書き換えない (dev 設定は cinny 側の管轄)。`npm run cinny-shell-smoke` はこの配信内容 (`homeserverList` が `["matrix.org"]` のみで synapse/dev ドメインを含まないこと、`allowCustomHomeservers: true`、`hideExplore` が有効になっていないこと) を実際に `fetch("/config.json")` して検証する (`homeserverConfigGate`、`evidence/cinny-shell-result.json`)。
 
 ## 開発手順
 

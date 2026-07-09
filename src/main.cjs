@@ -324,6 +324,39 @@ function resolveArtifact(envName, relativeParts) {
 const cinnyDist = resolveArtifact("SELFMATRIX_CINNY_DIST", ["cinny", "dist"]);
 const ecDist = resolveArtifact("SELFMATRIX_EC_DIST", ["element-call", "dist"]);
 
+// M2 homeserver 選択制 (運用者確定仕様: 自サーバーをアプリに焼き込まない。接続先はユーザーが
+// 手入力する。候補として提示するのは matrix.org のみ):
+//
+// cinny dist に含まれる config.json (`cinnyDist/config.json`、cinny リポジトリ直下の
+// config.json からコピーされたもの) は **ローカル dev 専用**の設定であり、
+// homeserverList が synapse.m.localhost/synapse.othersite.m.localhost (このワークスペースの
+// ローカル Matrix スタックのドメイン) を指し、hideExplore:true も付いている。この dev config を
+// 製品起動でそのまま配信すると、(a) 存在しない自サーバードメインが製品ホームサーバー選択肢に
+// 残ってしまう、(b) Explore タブが既定で隠れてしまう — どちらも製品要件に反する。
+// 一方 E2E (--e2e-real-join、e2e/native-join.e2e.mjs 等) は実際に
+// https://synapse.m.localhost へログインする検証であり、この dev config が無いと成立しない。
+//
+// そのためこのリポジトリは cinny/dist の config.json 自体には一切手を触れず (dev 専用設定は
+// cinny 側の管轄)、代わりに「配信するファイルを選ぶ」層をここに用意する。実際の切り替えは
+// startServer() の /config.json ルートが resolveCinnyConfigPath() を呼んで行う。
+//
+// resources/cinny-config.production.json (このリポジトリ内、新規) が製品 config の実体:
+// homeserverList は matrix.org のみ (自サーバードメインは一切含まない)、
+// allowCustomHomeservers:true でユーザーが任意のサーバー URL を手入力できる。cinny の
+// ClientConfig 型 (cinny/src/app/hooks/useClientConfig.ts) 準拠。hideExplore は付けない
+// (cinny の既定=表示のまま)。
+const PRODUCTION_CINNY_CONFIG_PATH = path.join(appRoot, "resources", "cinny-config.production.json");
+const DEV_CINNY_CONFIG_PATH = path.join(cinnyDist, "config.json");
+
+// E2E (--e2e-real-join) のときだけ従来どおり dev config (synapse 向け) を返す。
+// それ以外の全モード (フラグ無しの通常起動、--cinny-shell、--cinny-shell-smoke、
+// --harness/--smoke/--memory-probe 等) は製品 config を返す — harness 系モードは実際には
+// cinny 本体をロードしないため config.json が要求されることは無いが、万一要求されても
+// dev config (自サーバードメイン入り) を漏らさないよう安全側の製品 config を既定にする。
+function resolveCinnyConfigPath() {
+  return isE2ERealJoin ? DEV_CINNY_CONFIG_PATH : PRODUCTION_CINNY_CONFIG_PATH;
+}
+
 function contentType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".html") return "text/html; charset=utf-8";
@@ -428,6 +461,23 @@ function startServer() {
     if (url.pathname === "/health.json") {
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ ok: true, cinnyDist, ecDist }));
+      return;
+    }
+
+    // M2 homeserver 選択制 (PRODUCTION_CINNY_CONFIG_PATH 定義箇所のコメント参照): cinny
+    // (build.config.ts の base:'/') は config.json を常にオリジンルート相対 ("/config.json"、
+    // ClientConfigLoader.tsx の `${BASE_URL}/config.json`) で fetch するため、--cinny-shell
+    // (cinny がトップフレームでルートを占有する、本番同様のトポロジ) で実際に踏まれるのは
+    // このルートのみ。/cinny/config.json (harness の /cinny/ iframe embed 経路向け。現状
+    // desktop-shell.js は実際には cinny をロードしないため到達しないが、将来 harness が本物の
+    // cinny を埋め込むよう変わっても dev config を漏らさないための保険) にも同じ切り替えを
+    // 適用しておく。cinny/dist の config.json ファイル自体はここでも書き換えない
+    // (resolveCinnyConfigPath() が読むだけ)。
+    if (url.pathname === "/config.json" || url.pathname === "/cinny/config.json") {
+      const configPath = resolveCinnyConfigPath();
+      if (fs.existsSync(configPath)) return serveFile(response, configPath);
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found");
       return;
     }
 
@@ -2080,6 +2130,41 @@ async function runCinnyShellSmoke() {
       exposedSelfmatrixNativeKeys[0] === "claimWidgetTransport",
   };
 
+  // 1c. M2 homeserver 選択制 (運用者確定仕様: 自サーバーを焼き込まない。候補は matrix.org のみ。
+  // カスタムホームサーバー入力を許可する): この smoke は常に --cinny-shell-smoke (E2E ではない) で
+  // 起動するため、startServer() の "/config.json" ルート (resolveCinnyConfigPath() 定義箇所参照) は
+  // 製品 config (resources/cinny-config.production.json) を返しているはず。「配信された実際の
+  // レスポンス」を cinny と同じ経路 (fetch("/config.json"), ClientConfigLoader.tsx 参照) で取得し、
+  // 中身を検証する — cinny の ClientConfig 型 (cinny/src/app/hooks/useClientConfig.ts) に合わせて
+  // homeserverList・allowCustomHomeservers・hideExplore を見る。
+  const servedCinnyConfig = await win.webContents.executeJavaScript(
+    `fetch("/config.json").then((response) => response.json())`,
+    true,
+  );
+  const servedHomeserverList = Array.isArray(servedCinnyConfig && servedCinnyConfig.homeserverList)
+    ? servedCinnyConfig.homeserverList
+    : [];
+  // dev config (cinny/dist/config.json) が指す自サーバードメイン/ローカルスタックの痕跡。
+  // これらのいずれかが homeserverList に混入していれば、E2E 以外のモードで dev config が漏れて
+  // いる (=モード分岐が壊れている) ことを意味する。
+  const FORBIDDEN_HOMESERVER_SUBSTRINGS = ["synapse", "mesugaki", ".localhost"];
+  const forbiddenHomeserverEntries = servedHomeserverList.filter((entry) =>
+    FORBIDDEN_HOMESERVER_SUBSTRINGS.some((needle) => String(entry).toLowerCase().includes(needle)),
+  );
+  const homeserverConfigGate = {
+    homeserverList: servedHomeserverList,
+    forbiddenHomeserverEntries,
+    allowCustomHomeservers: servedCinnyConfig ? servedCinnyConfig.allowCustomHomeservers : undefined,
+    hideExplore: servedCinnyConfig ? servedCinnyConfig.hideExplore : undefined,
+    pass:
+      Boolean(servedCinnyConfig) &&
+      servedHomeserverList.length === 1 &&
+      servedHomeserverList[0] === "matrix.org" &&
+      forbiddenHomeserverEntries.length === 0 &&
+      servedCinnyConfig.allowCustomHomeservers === true &&
+      servedCinnyConfig.hideExplore !== true,
+  };
+
   // 2. 通話 1 本分の transport を一度だけ claim し (real NativeCallEmbed のコンストラクタが
   // claimWidgetTransport() を呼ぶのと同じ操作)、以降の全ステップで使い回す。onCallControlState()
   // の購読もここで一度だけ登録する (design §3 step 3b 実装要件 4 の受信側)。
@@ -2389,6 +2474,7 @@ async function runCinnyShellSmoke() {
       bridgePresent &&
       cinnyTopFrame &&
       contractSurfaceGate.pass &&
+      homeserverConfigGate.pass &&
       Boolean(claimGuard) &&
       Object.values(urlValidationGate).every((check) => check.pass) &&
       validOpenCallView.pass &&
@@ -2399,6 +2485,7 @@ async function runCinnyShellSmoke() {
     bridgePresent,
     cinnyTopFrame,
     contractSurfaceGate,
+    homeserverConfigGate,
     claimGuard,
     urlValidationGate: deepSanitizeEvidence(urlValidationGate),
     validOpenCallView,
