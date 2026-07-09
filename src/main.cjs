@@ -38,6 +38,14 @@ const {
 // 両方がこれを require する -- 判定ロジックの二重実装によるズレを防ぐ。
 const { resolveDisplayMediaSelection } = require("./source-picker-selection.cjs");
 
+// M2 minisign 署名検証 (--minisign-probe 専用の require): verifyMinisign() 自体は Electron に
+// 依存しない純関数だが、その prehashed (BLAKE2b-512) 経路が Electron のメインプロセス上でも実際に
+// 正しく動くこと (= plain Node の probe だけでは検証できない、production ランタイム固有の懸念) を
+// 確認するのがこの require の目的。runMinisignProbe() 内でのみ使う (require 自体はここで済ませて
+// おく方が他の require と一貫する)。
+const { verifyMinisign } = require("./minisign-verify.cjs");
+const { blake2b512, NATIVE_BLAKE2B512_AVAILABLE } = require("./minisign-blake2b.cjs");
+
 // F1 (受け入れレビュー修正): smoke がハンドシェイク完了後に注入する偽メッセージの action 名。
 // widgetId をわざと WIDGET_ID と不一致にしてあるので validateWidgetBridgeMessage の
 // widget_id_mismatch で必ず拒否される想定 — 拒否されなければ (＝すり抜ければ) smoke は fail する。
@@ -177,6 +185,19 @@ if (isE2ERealJoin && app) {
 // (トレイ生成 + close-to-tray 有効) で起動し、runTrayProbe() が各挙動を直接呼んで
 // evidence/tray-probe-result.json に記録する。
 const isTrayProbe = process.argv.includes("--tray-probe");
+
+// M2 minisign 署名検証: --minisign-probe は「Ed25519 検証 + BLAKE2b-512 (prehashed 既定方式) が
+// Electron のメインプロセスが実際に同梱する node:crypto ランタイム上で正しく動く」ことを検証する
+// 専用モード。plain node 上で走る src/minisign-verify-probe.cjs (npm test に既に組込済み) だけでは
+// 足りない理由: plain Node は crypto.createHash('blake2b512') が使えるが、**Electron 43 が同梱する
+// crypto にはこれが一切無い** (crypto.getHashes() が空配列を返す — 2026-07-09 実測)。そのため plain
+// node の probe は常にネイティブ blake2b 経路を通り、production (Electron main、ネイティブ無し →
+// minisign-blake2b.cjs のピュア JS フォールバック) と別のコードパスしか検証できていなかった。
+// runMinisignProbe() は他の probe (smoke/tray-probe 等) と異なり、cinny/EC dist の存在確認や
+// ウィンドウ/HTTP サーバーの起動を一切必要としない (verifyMinisign() は fs にすら触れない純粋な
+// crypto 計算) ため、main() の重いブート経路には乗せず独立に実行する (下部の `if (app) {...}` 分岐
+// 参照)。
+const isMinisignProbe = process.argv.includes("--minisign-probe");
 
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
@@ -3087,6 +3108,113 @@ async function runTrayProbe() {
   app.exit(result.pass ? 0 : 1);
 }
 
+// M2 minisign 署名検証: --minisign-probe の本体。plain node 版 probe (minisign-verify-probe.cjs)
+// と意図して独立にテストベクタを組み立てる (検証ロジックのバグをテストコード側のバグで隠す
+// リスクを避けるため、他の probe との使い回しはしない)。ここで確かめたいことは 3 つだけ:
+//   1. この Electron プロセスの node:crypto に blake2b512 が本当に無い
+//      (NATIVE_BLAKE2B512_AVAILABLE === false であること自体を実測する — Electron が将来
+//      blake2b512 をネイティブに持つようになったらこの assertion は書き換えが要る、という意味で
+//      「今の Electron 43 の事実」のスナップショットである点に注意)。
+//   2. その状態で prehashed (BLAKE2b-512, 現行既定) の正当な署名が ok:true になる
+//      (= minisign-blake2b.cjs のピュア JS フォールバックを経由して実際に検証が成立している)。
+//   3. ファイル改ざんは ok:false になる (= フォールバック経路でも検証が「何でも通す」ザルになって
+//      いない)。
+// legacy ('Ed') 経路も同じ 2 点 (正当 -> true / 改ざん -> false) を併せて確認する (Ed25519 自体は
+// BLAKE2b と無関係だが、Electron の node:crypto 上で Ed25519 + JWK raw key 変換が動くこと自体は
+// legacy 経路でしか単独確認できないため)。
+async function runMinisignProbe() {
+  await app.whenReady();
+  const crypto = require("node:crypto");
+
+  function rawPublicKeyBytes(publicKeyObject) {
+    const jwk = publicKeyObject.export({ format: "jwk" });
+    return Buffer.from(jwk.x, "base64url");
+  }
+  function encodePublicKeyFile({ comment, keyId, publicKeyObject }) {
+    const raw = rawPublicKeyBytes(publicKeyObject);
+    const blob = Buffer.concat([Buffer.from("Ed", "ascii"), keyId, raw]);
+    return `untrusted comment: ${comment}\n${blob.toString("base64")}\n`;
+  }
+  function encodeSignatureFile({ comment, keyId, algBytes, fileBytes, trustedComment, privateKey }) {
+    const message = algBytes === "ED" ? blake2b512(fileBytes) : fileBytes;
+    const signature = crypto.sign(null, message, privateKey);
+    const sigBlob = Buffer.concat([Buffer.from(algBytes, "ascii"), keyId, signature]);
+    const globalMessage = Buffer.concat([sigBlob, Buffer.from(trustedComment, "utf8")]);
+    const globalSignature = crypto.sign(null, globalMessage, privateKey);
+    return (
+      `untrusted comment: ${comment}\n${sigBlob.toString("base64")}\n` +
+      `trusted comment: ${trustedComment}\n${globalSignature.toString("base64")}\n`
+    );
+  }
+  function flipByte(buf, index) {
+    const copy = Buffer.from(buf);
+    copy[index] = copy[index] ^ 0xff;
+    return copy;
+  }
+
+  const keyPair = crypto.generateKeyPairSync("ed25519"); // 使い捨て。プロセス内のみ、どこにも書き出さない。
+  const keyId = crypto.randomBytes(8);
+  const fileBytes = crypto.randomBytes(8192); // installer に見立てたダミーバイナリ
+  const tamperedFileBytes = flipByte(fileBytes, 4096);
+  const publicKeyText = encodePublicKeyFile({
+    comment: "minisign electron probe test key (self-generated, not real minisign output)",
+    keyId,
+    publicKeyObject: keyPair.publicKey,
+  });
+
+  const algResults = {};
+  for (const algBytes of ["ED", "Ed"]) {
+    const trustedComment = `timestamp:1735689600\tfile:SelfMatrix-Setup-0.1.0.exe\talg:${algBytes}`;
+    const sigText = encodeSignatureFile({
+      comment: "minisign electron probe test signature",
+      keyId,
+      algBytes,
+      fileBytes,
+      trustedComment,
+      privateKey: keyPair.privateKey,
+    });
+    const validResult = verifyMinisign({ fileBytes, sigText, publicKeyText });
+    const tamperedResult = verifyMinisign({ fileBytes: tamperedFileBytes, sigText, publicKeyText });
+    algResults[algBytes] = {
+      validOk: validResult.ok === true,
+      validResult,
+      tamperedRejected: tamperedResult.ok === false,
+      tamperedResult,
+    };
+  }
+
+  const result = {
+    pass:
+      NATIVE_BLAKE2B512_AVAILABLE === false &&
+      algResults.ED.validOk &&
+      algResults.ED.tamperedRejected &&
+      algResults.Ed.validOk &&
+      algResults.Ed.tamperedRejected,
+    // このプロセス (Electron のメインプロセス) の node:crypto に blake2b512 が無いことの実測。
+    // false であること自体が「prehashed 経路は minisign-blake2b.cjs のピュア JS フォールバックを
+    // 通っている」ことの証拠になる (native が使えるなら fallback は経由されず、この probe は
+    // production の懸念点を検証したことにならない)。
+    nativeBlake2b512Available: NATIVE_BLAKE2B512_AVAILABLE,
+    prehashed: algResults.ED,
+    legacy: algResults.Ed,
+    electron: process.versions.electron,
+    node: process.versions.node,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "minisign-electron-probe-result.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[minisign-electron-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
+
+  app.exit(result.pass ? 0 : 1);
+}
+
 async function main() {
   await app.whenReady();
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
@@ -3132,16 +3260,32 @@ function evidenceFileForMode() {
 }
 
 if (app) {
-  main().catch((error) => {
-    fs.mkdirSync(evidenceDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(evidenceDir, evidenceFileForMode()),
-      `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
-      "utf8",
-    );
-    console.error(error);
-    app.exit(1);
-  });
+  // --minisign-probe は main() の重いブート経路 (cinny/EC dist 存在確認・HTTP サーバー・
+  // ウィンドウ生成) を必要としない (runMinisignProbe() のコメント参照) ため、main() を経由せず
+  // 独立に起動する。
+  if (isMinisignProbe) {
+    runMinisignProbe().catch((error) => {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(evidenceDir, "minisign-electron-probe-result.json"),
+        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+        "utf8",
+      );
+      console.error(error);
+      app.exit(1);
+    });
+  } else {
+    main().catch((error) => {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(evidenceDir, evidenceFileForMode()),
+        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+        "utf8",
+      );
+      console.error(error);
+      app.exit(1);
+    });
+  }
 } else if (require.main === module) {
   throw new Error("selfmatrix-desktop requires Electron. Use `electron src/main.cjs`.");
 }
