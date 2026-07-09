@@ -13,6 +13,22 @@ ipcRenderer.on("native:widget-from-view", (_event, message) => {
   window.postMessage(message, window.location.origin);
 });
 
+// M2 デスクトップ通知 (通知クリック→前面化): main.cjs の NOTIFICATION_CLICK_BRIDGE_SCRIPT が
+// mainWindow の main world (cinny 自身のバンドルが動くコンテキスト) へ dom-ready のたびに注入する
+// window.Notification ラッパから、通知がクリックされるたびに window.postMessage() で折り返して
+// くる合図をここで受け取る。方向は上の native:widget-from-view (main→postMessage) の逆
+// (main world→postMessage→ここ) だが、同じ「preload の isolated world と main world は同一フレーム
+// なので window.postMessage で橋渡しできる」性質を使っているだけの対称パターン。
+// cinny 側のコードは一切変更していない (Notification インスタンスへ追加の click リスナーを
+// 注入しているだけで、cinny 自身が設定した onclick 等は上書きしない)。ここで受け取ったら
+// ipcRenderer.send() で main プロセスへ中継するだけ -- window.selfmatrixNative
+// (claimWidgetTransport() の契約) には一切追加しない、完全に内部実装の合図経路。
+window.addEventListener("message", (event) => {
+  if (event.origin !== window.location.origin) return;
+  if (!event.data || event.data.type !== "selfmatrix:notification-click") return;
+  ipcRenderer.send("native:notification-click");
+});
+
 // M1 step 3b 実装要件 4: call view preload (call-control-preload.cjs) からの
 // MutationObserver 由来 state push (native:call-control:state, main.cjs が素通し転送) を
 // onCallControlState() で登録されたリスナー全員へ配る。design §2.2 の「main は解釈しない

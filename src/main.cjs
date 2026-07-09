@@ -277,6 +277,53 @@ const E2E_RTC_WRAPPER_SCRIPT = `(() => {
   window.RTCPeerConnection = Wrapped;
 })();`;
 
+// M2 デスクトップ通知 (通知クリック→前面化): mainWindow の main world (cinny 自身のバンドルが
+// 動くコンテキスト) へ dom-ready のたびに注入する window.Notification ラッパ。cinny は Web
+// Notification API (`new Notification(...)`) を呼ぶだけで、Electron がそれを自動的に OS ネイティブ
+// 通知へ変換する (main.cjs はこの変換自体には一切関与しない、Electron 標準の挙動)。ここで足りて
+// いないのは「その通知がクリックされたら selfmatrix-desktop 側でウィンドウを前面化する」導線であり、
+// Web Notification の 'click' イベントは通知を生成したレンダラ (=このウィンドウ) 側でしか観測でき
+// ない。
+//
+// cinny 側のコードは一切変更しない (契約 window.selfmatrixNative も広げない、README の絶対条件)。
+// 代わりに E2E_RTC_WRAPPER_SCRIPT と全く同じ手法 (Proxy でコンストラクタを包み、生成された各
+// インスタンスへ追加の addEventListener を足す) を使う: contextIsolation 下では preload の
+// isolated world から window.Notification を直接上書きしても main world (cinny 自身のバンドルが
+// 実際に new Notification() する場所) には反映されない (E2E_RTC_WRAPPER_SCRIPT のコメント参照) ため、
+// dom-ready 後に webContents.executeJavaScript() で main world へ直接注入する必要がある。
+// 追加するのは「既存の (cinny 自身が設定するかもしれない) onclick 等はそのままに、常にもう 1 つ
+// click リスナーを足す」だけなので、cinny 自身の通知まわりの挙動 (onclick で室へジャンプする等) を
+// 上書き/破壊しない。
+//
+// contextIsolation 下で main world から main プロセスへ直接 IPC する手段は無い (ipcRenderer は
+// preload の isolated world だけが持つ) ため、window.postMessage() で同一オリジンの window 自身へ
+// 折り返す -- shell-preload.cjs 側 (isolated world) がこのフレームに対して window 'message'
+// リスナーを登録しておき、そこから ipcRenderer.send("native:notification-click") で main プロセスへ
+// 中継する (これも native:widget-from-view の逆方向で、既に確立済みの
+// postMessage ブリッジパターンを踏襲しているだけ)。この postMessage 経路は window.selfmatrixNative
+// の contextBridge 公開面には一切現れない、完全に内部実装の合図。
+const NOTIFICATION_CLICK_MESSAGE_TYPE = "selfmatrix:notification-click";
+const NOTIFICATION_CLICK_BRIDGE_SCRIPT = `(() => {
+  if (window.__selfmatrixNotificationBridgeInstalled) return;
+  window.__selfmatrixNotificationBridgeInstalled = true;
+  const NativeNotification = window.Notification;
+  if (!NativeNotification) return;
+  const Wrapped = new Proxy(NativeNotification, {
+    construct(target, args) {
+      const notification = new target(...args);
+      try {
+        notification.addEventListener("click", () => {
+          window.postMessage({ type: ${JSON.stringify(NOTIFICATION_CLICK_MESSAGE_TYPE)} }, window.location.origin);
+        });
+      } catch (error) {
+        // ベストエフォート -- ここで失敗しても cinny 自身の通知表示/onclick を壊してはならない。
+      }
+      return notification;
+    },
+  });
+  window.Notification = Wrapped;
+})();`;
+
 const state = {
   origin: null,
   server: null,
@@ -629,6 +676,26 @@ function createMainWindow() {
   // 存在しない space の lobby ルートに迷い込む (実機ログインで実際に再現/特定した)。
   // --cinny-shell モードではオリジンのルート ("/") 自体を cinny の index.html として配信する
   // よう startServer() 側も変更したので、ここも合わせてルートをロードする。
+  // M2 デスクトップ通知: dom-ready のたびに Notification ラッパを main world へ注入する
+  // (NOTIFICATION_CLICK_BRIDGE_SCRIPT のコメント参照)。E2E_RTC_WRAPPER_SCRIPT の注入パターンと
+  // 同じ理由で dom-ready を使う -- cinny のバンドルが実際に new Notification() する (通知を出す)
+  // よりずっと前に、確実に先回りして注入を終わらせる。cinny/harness どちらのトポロジでも
+  // (mainWindow が読み込む文書が何であれ) 常時注入する -- Notification が一度も使われなければ
+  // 完全に無害 (window.Notification が無ければ即 return する、スクリプト側のガード参照)。
+  // 実測で発覚 (このコミット): このリスナー登録は必ず win.loadURL() より **前** でなければならない
+  // -- createCallViewIfNeeded() の dom-ready リスナー登録がロード前に済んでいるのと同じ理由で、
+  // 後ろに置くと初回ナビゲーションの dom-ready をレース的に取りこぼす (実機で
+  // bridgeInstalled:false を確認済み、tray-probe の notificationClickFocusesWindow で検知できる)。
+  win.webContents.on("dom-ready", () => {
+    win.webContents.executeJavaScript(NOTIFICATION_CLICK_BRIDGE_SCRIPT, true).catch((error) => {
+      state.widgetMessages.push({
+        t: Date.now(),
+        type: "notification-click-bridge-inject-error",
+        error: String(error && error.message ? error.message : error),
+      });
+    });
+  });
+
   win.loadURL(isCinnyShell ? `${state.origin}/` : `${state.origin}/desktop-shell.html`);
   state.mainWindow = win;
   win.on("resize", updateCallViewBounds);
@@ -790,13 +857,46 @@ function quitFromTray() {
   app.quit();
 }
 
+// M2 自動起動 (opt-in、既定 OFF): Windows のスタートアップ登録は app.setLoginItemSettings() が
+// 実際にレジストリ (Run キー相当) へ書き込む。**このプロセス自身が読み書きするのは、ユーザーが
+// トレイメニューのチェック項目を実際にクリックしたときだけ** -- 起動時に自動で有効化する経路は
+// どこにも無い (既定 OFF)。
+//
+// currentAutoLaunchEnabled()/setAutoLaunchEnabled() をそれぞれ 1 箇所に集約してあるのは、
+// runTrayProbe() (下記) がテスト中に app.getLoginItemSettings/app.setLoginItemSettings 自体を
+// スパイに差し替えられるようにするため -- トグルの判定ロジック (toggleAutoLaunch()) はこの 2 関数
+// 経由でしか OS 状態に触れないので、スパイに差し替えている間は実レジストリに一切書き込まれない
+// (runTrayProbe() の autoLaunchToggle 検証コメント参照)。
+function currentAutoLaunchEnabled() {
+  return app.getLoginItemSettings().openAtLogin === true;
+}
+
+function setAutoLaunchEnabled(enabled) {
+  app.setLoginItemSettings({ openAtLogin: enabled });
+}
+
+// トレイメニューのチェック項目の click ハンドラ本体。Electron の Menu は実際にトレイへ設定された
+// 後はクリックのたびに menuItem.checked を自動反転してくれるが、trayMenuTemplate() は
+// (runTrayProbe() にも同じ定義を渡せるよう) 生のテンプレート配列のままなので、その自動反転には
+// 依存しない -- 現在値は毎回 currentAutoLaunchEnabled() で OS から実測して反転させる。これにより
+// runTrayProbe() が生テンプレートの click() を直接呼んでも (実際の Menu UI を経由しなくても)
+// 本番と全く同じロジックが動く。
+function toggleAutoLaunch() {
+  setAutoLaunchEnabled(!currentAutoLaunchEnabled());
+}
+
+const AUTO_LAUNCH_MENU_LABEL = "PC 起動時に自動起動";
+
 // トレイの右クリックメニュー定義。「将来ミュート制御等を足せる構造にしておく」という要件どおり、
 // 項目は配列で持つ (増やす場合はこの配列に追記するだけでよい)。状態を持たない純関数として書いて
 // あるので、createTray() が実際にトレイへ設定するのと runTrayProbe() が検証用に取得するのとで
-// 常に同じ定義になる。
+// 常に同じ定義になる (checked の初期値だけは currentAutoLaunchEnabled() 経由で実際の OS 状態を
+// 読むが、これは読み取り専用でありメニュー生成そのものに副作用は無い)。
 function trayMenuTemplate() {
   return [
     { label: "SelfMatrix を開く", click: () => handleTrayActivate() },
+    { type: "separator" },
+    { label: AUTO_LAUNCH_MENU_LABEL, type: "checkbox", checked: currentAutoLaunchEnabled(), click: () => toggleAutoLaunch() },
     { type: "separator" },
     { label: "終了", click: () => quitFromTray() },
   ];
@@ -1403,6 +1503,15 @@ function invokeCallControl(action) {
 }
 
 function setupIpc() {
+  // M2 デスクトップ通知: shell-preload.cjs (isolated world) が window 'message' で受け取った
+  // NOTIFICATION_CLICK_MESSAGE_TYPE の合図をここへ中継してくる。main は「前面化する」以上のことを
+  // 一切しない (handleTrayActivate() はトレイクリックと全く同じ関数 -- 実装を二重化しない)。
+  // window.selfmatrixNative の contextBridge 公開面には現れないチャンネルなので、cinny 契約は
+  // 広がっていない。
+  ipcMain.on("native:notification-click", () => {
+    handleTrayActivate();
+  });
+
   // M2 セキュリティ監査 (「shell の API 露出面整理」): get-status/ensure-call-view/
   // detach-call-view/attach-call-view の 4 チャンネルは harness (desktop-shell.js /
   // shell-widget-host.js) だけが叩く実装で、cinny 側の契約 (nativeBridge.ts の
@@ -2793,6 +2902,11 @@ function setupE2EIntrospection() {
 // evidence を書いて app.exit() でライフサイクルを自己完結させる (window-all-closed からの
 // app.quit() はこのモードでは無効化してある — 上の app.on("window-all-closed", ...) のコメント
 // 参照)。
+//
+// M2 デスクトップ通知/自動起動 (以下、この関数に相乗り): OS のトレイ同様、実 OS 通知のクリックや
+// 実レジストリへの自動起動登録も自動化テストから直接は起こせない/起こしたくない対象なので、
+// 同じ「ロジック本体を直接呼んで機械的に検証する」方針をここに拡張した -- 新しい npm script は
+// 増やさず、この 1 モードに追加した (B: notificationClickFocusesWindow, C: autoLaunchToggle 参照)。
 async function runTrayProbe() {
   const win = state.mainWindow;
 
@@ -2814,6 +2928,7 @@ async function runTrayProbe() {
     labels: menuLabels,
     containsOpenLabel: menuLabels.some((label) => typeof label === "string" && label.includes("開く")),
     containsQuitLabel: menuLabels.some((label) => typeof label === "string" && label.includes("終了")),
+    containsAutoLaunchLabel: menuLabels.some((label) => label === AUTO_LAUNCH_MENU_LABEL),
   };
 
   // trayClickShowsWindow: closeHidesWindow のステップで隠した (または壊れて破棄された)
@@ -2826,6 +2941,100 @@ async function runTrayProbe() {
     await wait(100);
     trayClickShowsWindow = win.isVisible() === true;
   }
+
+  // B. notificationClickFocusesWindow: NOTIFICATION_CLICK_BRIDGE_SCRIPT (main world 注入) →
+  // shell-preload.cjs の window 'message' 中継 → ipcMain.on("native:notification-click") →
+  // handleTrayActivate() という配線をエンドツーエンドで検証する。OS の実通知クリックそのものは
+  // 自動化できないため、mainWindow の main world 上で実際に `new Notification()` してから、その
+  // インスタンスへ合成の 'click' イベントを dispatch する -- Notification は EventTarget であり、
+  // 合成 dispatchEvent は我々のラッパが addEventListener() で足したリスナーを本物の OS クリックと
+  // 同じ経路で発火させる (cinny 自身がまだ onclick 等を設定していなくても、ここで足したリスナーは
+  // 独立して動く)。ウィンドウを隠した状態から始め、この一連の配線だけで再び可視になることを
+  // 実測する。
+  let notificationClickFocusesWindow = false;
+  let notificationDispatchOutcome = null;
+  let notificationProbeAttempts = 0;
+  if (!win.isDestroyed()) {
+    // 実測で発覚 (このコミット): dom-ready ハンドラの executeJavaScript() 注入は非同期 (IPC 往復) で
+    // あり、cinny 本体 (SPA バンドル一式) の dom-ready 到達に数秒かかることがある (実測: このリポジトリ
+    // 環境で ~5.7 秒。waitForCallControlInvoke(20000, ...) の G5 コメントにも「EC の ErrorView
+    // マウントまで実測 ~9.95 秒」という同種の記録がある — この規模のバンドルロードが数秒〜十数秒
+    // かかること自体は既知)。ウィンドウ生成直後にテストする tray-probe はこの起動完了より早く到達し
+    // 得るため、「一度だけ試して即座に pass/fail を決める」のではなく、実際の効果 (hide → 合成 click →
+    // 前面化) を最大 20 秒 (既存の waitForCallControlInvoke(20000) と水準を揃えた)、間隔を空けて
+    // 再試行する。cinny 自身が途中でナビゲーションし直しても、そのたびに dom-ready ハンドラが
+    // ブリッジを再注入する (NOTIFICATION_CLICK_BRIDGE_SCRIPT の __selfmatrixNotificationBridgeInstalled
+    // ガード参照) ため、次の再試行では新しいドキュメントに対して自然に成功する。
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline && !notificationClickFocusesWindow) {
+      notificationProbeAttempts += 1;
+      win.hide();
+      // eslint-disable-next-line no-await-in-loop
+      await wait(150);
+      const hiddenBeforeClick = win.isVisible() === false;
+      // eslint-disable-next-line no-await-in-loop
+      notificationDispatchOutcome = await win.webContents
+        .executeJavaScript(
+          `(() => {
+            try {
+              const n = new Notification("selfmatrix-tray-probe");
+              n.dispatchEvent(new Event("click"));
+              return {
+                ok: true,
+                bridgeInstalled: window.__selfmatrixNotificationBridgeInstalled === true,
+                permission: (typeof Notification !== "undefined") ? Notification.permission : null,
+              };
+            } catch (error) {
+              return { ok: false, error: String(error && error.message ? error.message : error) };
+            }
+          })()`,
+          true,
+        )
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }));
+      // eslint-disable-next-line no-await-in-loop
+      await wait(250);
+      notificationClickFocusesWindow =
+        hiddenBeforeClick &&
+        Boolean(notificationDispatchOutcome && notificationDispatchOutcome.ok) &&
+        win.isVisible() === true;
+    }
+  }
+
+  // C. autoLaunchToggle: app.getLoginItemSettings/app.setLoginItemSettings をどちらもスパイへ
+  // 差し替えた (メモリ内のフェイク状態だけを更新する) 上で、トレイメニューのチェック項目の click
+  // ハンドラ (toggleAutoLaunch()) を 2 回叩き、実際に渡る引数 (openAtLogin: true → false) を
+  // 検証する。運用者の絶対条件「テストでレジストリを汚さない」への対応 -- スパイに差し替えている
+  // 間、本物の app.setLoginItemSettings は一度も呼ばれない。最後にスパイを元へ戻し、
+  // 本物の app.getLoginItemSettings().openAtLogin が false のまま (このテストで一度も実書き込み
+  // していないので当然 false のはず) であることまで確認して「残渣ゼロ」を実測する。
+  const originalGetLoginItemSettings = app.getLoginItemSettings.bind(app);
+  const originalSetLoginItemSettings = app.setLoginItemSettings.bind(app);
+  let fakeLoginItemState = { openAtLogin: false };
+  const capturedSetLoginItemCalls = [];
+  app.getLoginItemSettings = () => ({ ...fakeLoginItemState });
+  app.setLoginItemSettings = (settings) => {
+    capturedSetLoginItemCalls.push(settings);
+    fakeLoginItemState = { ...fakeLoginItemState, ...settings };
+  };
+  const autoLaunchItem = menuTemplate.find((item) => item.label === AUTO_LAUNCH_MENU_LABEL);
+  autoLaunchItem?.click(); // 期待: フェイク state は false → click() は {openAtLogin:true} を渡す
+  autoLaunchItem?.click(); // 期待: フェイク state は true (直前の click で更新済み) → 今度は {openAtLogin:false}
+  app.getLoginItemSettings = originalGetLoginItemSettings;
+  app.setLoginItemSettings = originalSetLoginItemSettings;
+  const realRegistryUntouchedAfter = app.getLoginItemSettings().openAtLogin === false;
+  const autoLaunchToggle = {
+    found: Boolean(autoLaunchItem),
+    capturedCalls: capturedSetLoginItemCalls,
+    toggleOnArgCorrect: capturedSetLoginItemCalls[0]?.openAtLogin === true,
+    toggleOffArgCorrect: capturedSetLoginItemCalls[1]?.openAtLogin === false,
+    realRegistryUntouchedAfter,
+    pass:
+      Boolean(autoLaunchItem) &&
+      capturedSetLoginItemCalls.length === 2 &&
+      capturedSetLoginItemCalls[0]?.openAtLogin === true &&
+      capturedSetLoginItemCalls[1]?.openAtLogin === false &&
+      realRegistryUntouchedAfter,
+  };
 
   // quitMenuReallyQuits: 「終了」メニュー項目の click ハンドラ (quitFromTray()) を直接呼ぶ。
   // 実プロセスを本当に殺す前に「app.isQuitting フラグが立ったか」「app.quit() が呼ばれたか」を
@@ -2849,12 +3058,19 @@ async function runTrayProbe() {
       closeHidesWindow &&
       contextMenuItems.containsOpenLabel &&
       contextMenuItems.containsQuitLabel &&
+      contextMenuItems.containsAutoLaunchLabel &&
       trayClickShowsWindow &&
+      notificationClickFocusesWindow &&
+      autoLaunchToggle.pass &&
       quitMenuReallyQuits,
     trayCreated,
     closeHidesWindow,
     contextMenuItems,
     trayClickShowsWindow,
+    notificationClickFocusesWindow,
+    notificationDispatchOutcome,
+    notificationProbeAttempts,
+    autoLaunchToggle,
     quitMenuReallyQuits,
     electron: process.versions.electron,
     chrome: process.versions.chrome,

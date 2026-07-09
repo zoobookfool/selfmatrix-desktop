@@ -259,16 +259,27 @@ function pushCallControlState(reason) {
 
 // CallControl.ts の controlMutationObserver 相当の一般化版: 実在する対象ボタンの属性変化を
 // 監視し、変化のたびに現在の call-control 状態を push する。
+// M2 GPT レビュー P2 (CallControl 再マウント耐性) 対応: 直近 observeCallControls() で属性監視を
+// 貼った実要素への参照。下の bodyMutationObserver のコールバックが「今の DOM から取り直した要素」と
+// これを比較し、実際に参照が変わった (= React が古い要素を破棄し新しい要素を作り直した) ときだけ
+// observeCallControls() を再実行する (controlElementsChanged() 参照)。invoke() 経由のクリックは
+// screenshareButton() 等が呼び出しのたびに document.querySelector() し直すため、この参照が古くても
+// クリック自体の到達には影響しない -- ここで守るのは「native invoke を経由しない自発的な状態変化
+// (リモート起因の自動レイアウト切替等) を属性 MutationObserver で拾って push する」経路の方。
+let observedControlElements = { screenshare: null, spotlight: null, emphasis: null };
+
 let callControlMutationObserver = null;
 function observeCallControls() {
   if (callControlMutationObserver) callControlMutationObserver.disconnect();
   callControlMutationObserver = new MutationObserver(() => pushCallControlState("mutation-observed"));
 
   const screenshareBtn = screenshareButton();
+  observedControlElements.screenshare = screenshareBtn;
   if (screenshareBtn) {
     callControlMutationObserver.observe(screenshareBtn, { attributes: true, attributeFilter: ["data-kind"] });
   }
   const spotlightBtn = spotlightButton();
+  observedControlElements.spotlight = spotlightBtn;
   if (spotlightBtn) {
     callControlMutationObserver.observe(spotlightBtn, { attributes: true });
   }
@@ -277,19 +288,51 @@ function observeCallControls() {
   // click 直後に明示 pushCallControlState() することでカバーする (CallControl.ts の
   // refreshEmphasisState() と同じ対策、design §2.2 注記)。
   const emphasisBtn = emphasisButton();
+  observedControlElements.emphasis = emphasisBtn;
   if (emphasisBtn) {
     callControlMutationObserver.observe(emphasisBtn, { attributes: true });
   }
 }
 
+// 追跡中の 3 要素 (screenshare/spotlight/emphasis) のいずれかが、直近 observeCallControls() が
+// 捕まえた参照と現在の DOM 上の実体とで食い違っているか (=作り直された/消えた/現れた) を返す。
+// bodyMutationObserver のコールバックがここで「本当に対象が入れ替わったか」を先に確認してから
+// observeCallControls() (disconnect + re-observe というやや重い処理) を呼ぶことで、コントロール
+// バーとは無関係な childList mutation (配信中の参加者タイル増減等) では何もしないで済む。
+function controlElementsChanged() {
+  return (
+    screenshareButton() !== observedControlElements.screenshare ||
+    spotlightButton() !== observedControlElements.spotlight ||
+    emphasisButton() !== observedControlElements.emphasis
+  );
+}
+
 // CallControl.ts の bodyMutationObserver 相当: in-call コントロールバー自体の出現/消失
 // (React マウント/アンマウント) を検知して observeCallControls() を再実行する。
+//
+// M2 GPT レビュー P2 (再マウント耐性、実バグ修正): 以前は { childList:true, subtree:false } で
+// document.body の**直接の子要素**の増減だけを監視していた。この EC ビルド (React) は通常 body
+// 直下のルートコンテナ自体を差し替えない -- 設定モーダル開閉・レイアウト切替・配信開始停止・
+// ロビー⇔通話遷移などの「深い」再マウントは、body から数階層下がった場所で起きる childList
+// mutation でしかなく、subtree:false ではそもそも検知対象外だった。結果として
+// observeCallControls() が一度貼った属性 MutationObserver は、その後に対象要素が破棄され
+// 新しい要素に差し替わっても再実行されないままになり (detach 済みの古い要素を監視し続けるだけ)、
+// 「コントロールバー差し替えを取りこぼす」(このコミットのタスク記述どおり) 状態になっていた。
+// 修正: subtree:true にして「call view (EC 埋め込み専用の隔離された WebContentsView、cinny 本体の
+// チャット UI 等は含まれない) の DOM 内で起きるあらゆる階層の childList mutation」を検知対象に
+// する。call view はコントロール UI 専用ページなので対象を広げても実害は限定的だが、それでも
+// 配信中は参加者タイルの増減等で mutation 頻度が上がり得るため、コールバック内では
+// controlElementsChanged() で「追跡中の 3 要素が実際に入れ替わったか」を先に確認し、変わって
+// いなければ observeCallControls() の再実行自体をスキップする (過剰な MutationObserver の
+// disconnect/re-observe によるパフォーマンス劣化を避けつつ、実際の差し替えは確実に拾う)。
 let bodyMutationObserver = null;
 function ensureBodyObserver() {
   if (bodyMutationObserver) return;
   if (!document.body) return;
-  bodyMutationObserver = new MutationObserver(() => observeCallControls());
-  bodyMutationObserver.observe(document.body, { childList: true, subtree: false });
+  bodyMutationObserver = new MutationObserver(() => {
+    if (controlElementsChanged()) observeCallControls();
+  });
+  bodyMutationObserver.observe(document.body, { childList: true, subtree: true });
   observeCallControls();
 }
 
