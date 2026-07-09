@@ -28,9 +28,11 @@
  * (M1 step 3c-1)」節を参照。
  *
  * **dev/E2E 専用**: Electron 起動引数に `--e2e-real-join` を渡す。main.cjs 側はこのフラグ
- * (isE2ERealJoin) を見て初めて `--ignore-certificate-errors` / `--use-fake-ui-for-media-stream` /
- * `--use-fake-device-for-media-stream` を appendSwitch する (main.cjs 冒頭のコメント参照) —
- * 実オーディオデバイスは絶対に使わない。
+ * (isE2ERealJoin) を見て初めて `--ignore-certificate-errors` / `--auto-accept-camera-and-microphone-capture`
+ * (getUserMedia の camera/mic 許可のみを自動承認する。M2 レビューで `--use-fake-ui-for-media-stream`
+ * が getDisplayMedia() の選択 UI まで丸ごと横取りして画面共有ソースピッカーを迂回してしまうことが
+ * 判明したため、より狭いスコープのこのフラグへ差し替えた) / `--use-fake-device-for-media-stream` を
+ * appendSwitch する (main.cjs 冒頭のコメント参照) — 実オーディオデバイスは絶対に使わない。
  *
  * M1 step 3c-2/3c-3 (native-callflow.e2e.mjs 実装時のリファクタ): ログイン/モーダル片付け/
  * ルーム参加/main プロセス内部状態の読み取り/サニタイズといった共通ロジックは

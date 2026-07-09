@@ -16,6 +16,7 @@ SelfMatrix のネイティブデスクトップシェル (Electron)。Matrix ク
   - `shell-preload.cjs` / `shell-widget-host.js` — cinny 側 (mainWindow) の preload と、本物の `ClientWidgetApi` を動かす通常スクリプト。`claimWidgetTransport()` が通話 1 本につき 1 回だけ払い出す transport オブジェクトが `window.selfmatrixNative` として cinny から見える。
   - `call-control-preload.cjs` — 通話 View (Element Call) 側の preload。screenshare/spotlight/emphasis/reactions/settings/sound の実 DOM 操作を担当し、host からは RPC 経由でのみ駆動される。
   - `desktop-shell.html` / `desktop-shell.js` — cinny を iframe として埋め込む harness モード (`--harness` を明示指定したとき、または `--smoke`/`--memory-probe` などバックエンド無しでの自動検証用に使う。本番トポロジ (既定の起動、`--cinny-shell` 相当) とは別)。
+  - `source-picker.html` / `source-picker-preload.cjs` / `source-picker-selection.cjs` — M2 画面共有ソース選択 UI (Discord 風サムネイルピッカー)。`main.cjs` の `setDisplayMediaRequestHandler` は `desktopCapturer.getSources()` の結果を desktop 自身のネイティブピッカーウィンドウ (`source-picker.html`、cinny レンダラには一切露出しない) へ渡し、ユーザーが画面/ウィンドウのタブとサムネイルグリッドから 1 件を選び、システム音声トグルを設定して「共有」/「キャンセル」する。ピッカー ⇔ main の通信は専用 preload (`source-picker-preload.cjs`、`window.selfmatrixSourcePicker`) を使い、cinny 用の `window.selfmatrixNative` (`claimWidgetTransport` のみ) とは完全に別系統 -- この UI の追加で `window.selfmatrixNative` の契約は一切広げていない。「選択結果から `callback()` 引数を解決する」ロジックは Electron 非依存の `source-picker-selection.cjs` (`resolveDisplayMediaSelection()`) に切り出してあり、`source-picker-selection-probe.cjs` (`npm run probe:source-picker-selection`) が単体検証する。
   - `system-audio-probe.cjs` / `app-audio-capture-probe.cjs` — システム音声 (loopback) キャプチャとアプリ単位音声キャプチャの実機確認用スタンドアロン Electron スクリプト (`npm test` には含まれない)。
   - `resources/cinny-config.production.json` — 製品用の cinny `config.json` (下記「ホームサーバー設定の配信」参照)。
 
@@ -65,12 +66,15 @@ npm run harness       # harness モード (desktop-shell.html + cinny を iframe
 ### スモークテスト (バックエンド不要)
 
 ```powershell
-npm test              # smoke + memory + cinny-shell-smoke + tray-probe をまとめて実行
+npm test              # smoke + memory + cinny-shell-smoke + tray-probe + probe:source-picker-selection をまとめて実行
 npm run smoke
 npm run memory
 npm run cinny-shell-smoke
 npm run tray-probe    # トレイ常駐 (M2)。OS の実クリックは自動化できないため、close-to-tray/
                        # メニュー/クリックハンドラをプログラム的に検証する専用モード
+npm run probe:source-picker-selection   # M2 画面共有ソース選択 UI の選択解決ロジック (resolveDisplayMediaSelection())
+                                         # の単体検証。Electron を起動しない plain Node script -- ピッカー UI 自体の
+                                         # 存在/列挙/実クリックは npm run e2e:callflow (driveSourcePicker()) が検証する。
 ```
 
 `npm test` は Electron の実起動を伴う (headless CI で xvfb 等の準備が無い環境では失敗する)。結果は `evidence/*.json` に出力されるが、このリポジトリでは `evidence/` は `.gitignore` 済み — コミットしない (下記「証跡の扱い」参照)。
@@ -83,6 +87,8 @@ npm run tray-probe    # トレイ常駐 (M2)。OS の実クリックは自動化
 npm run e2e:join       # alice 1 人の実ログイン→実 LiveKit join
 npm run e2e:callflow   # alice/bob 2 ユーザー通話 + 画面共有 + 窓移動再接続 + call-control 7 語彙 + 通話跨ぎ回帰
 ```
+
+`e2e:callflow` は screenshare を開始するたびに実際に開くネイティブソースピッカー (M2、上記「shell 側の実装」参照) を自動バイパスせず、Playwright (`e2e/lib/nativeE2ELib.mjs` の `driveSourcePicker()`) でピッカーウィンドウを実際に操作する -- "SelfMatrix" を名前に含むタイルを選び、システム音声トグルを ON にしてから「共有」を押す。`evidence/native-callflow-result.json` の `passConditions.sourcePicker` にピッカーが開いたこと・ソース一覧が非空だったこと・システム音声 ON で実際に audio track が増えたことの実測が記録される。
 
 前提:
 

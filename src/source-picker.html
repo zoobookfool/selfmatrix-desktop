@@ -1,0 +1,264 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SelfMatrix - 画面を共有</title>
+    <style>
+      /*
+        M2 画面共有ソース選択 UI (Discord 風サムネイルピッカー)。
+        視覚の作り込みは最小限 (ブランド色などの磨き込みは後の UI 工程) -- ここで満たすのは
+        機能面 (列挙・選択・種別タブ・システム音声トグル・共有/キャンセル) の受け入れ基準のみ。
+        このファイルはドメイン名・個人情報を一切含まない自己完結 HTML (desktop 自身の信頼された
+        資産であり、cinny/EC の静的サーバ経由ではなく win.loadFile() で直接読み込まれる)。
+      */
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #2b2d31;
+        color: #f2f3f5;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        user-select: none;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 16px 20px 8px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 12px;
+        font-weight: 600;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+      }
+      .tab-button {
+        background: transparent;
+        border: none;
+        color: #b5bac1;
+        font-size: 13px;
+        font-weight: 600;
+        padding: 6px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .tab-button.active {
+        background: #404249;
+        color: #ffffff;
+      }
+      main {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px 20px;
+      }
+      #picker-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 12px;
+      }
+      .picker-tile {
+        background: #1e1f22;
+        border: 2px solid transparent;
+        border-radius: 8px;
+        padding: 0;
+        cursor: pointer;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+      .picker-tile:hover {
+        border-color: #4e5058;
+      }
+      .picker-tile.selected {
+        border-color: #5865f2;
+      }
+      .picker-tile-thumb {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #111214;
+        object-fit: contain;
+        display: block;
+      }
+      .picker-tile-label {
+        padding: 6px 8px;
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .picker-empty {
+        color: #949ba4;
+        font-size: 13px;
+        padding: 24px 4px;
+      }
+      footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 20px 16px;
+        border-top: 1px solid #1e1f22;
+      }
+      .audio-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: #dbdee1;
+      }
+      .footer-buttons {
+        display: flex;
+        gap: 8px;
+        margin-left: auto;
+      }
+      button.action {
+        border: none;
+        border-radius: 6px;
+        padding: 8px 16px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #picker-cancel {
+        background: transparent;
+        color: #dbdee1;
+      }
+      #picker-cancel:hover {
+        text-decoration: underline;
+      }
+      #picker-share {
+        background: #5865f2;
+        color: #ffffff;
+      }
+      #picker-share:disabled {
+        background: #3a3c8a;
+        color: #9aa0e8;
+        cursor: not-allowed;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>共有する画面またはウィンドウを選択</h1>
+      <div class="tabs">
+        <button type="button" id="picker-tab-screen" class="tab-button" data-picker-tab="screen">画面</button>
+        <button type="button" id="picker-tab-window" class="tab-button" data-picker-tab="window">ウィンドウ</button>
+      </div>
+    </header>
+    <main>
+      <div id="picker-grid"></div>
+    </main>
+    <footer>
+      <label class="audio-row" id="audio-row" style="display: none">
+        <input type="checkbox" id="picker-system-audio" />
+        システム音声も共有
+      </label>
+      <div class="footer-buttons">
+        <button type="button" id="picker-cancel" class="action">キャンセル</button>
+        <button type="button" id="picker-share" class="action" disabled>共有</button>
+      </div>
+    </footer>
+    <script>
+      (function () {
+        let sources = [];
+        let selectedId = null;
+        let currentTab = "screen";
+
+        function tilesForCurrentTab() {
+          return sources.filter((source) => source.type === currentTab);
+        }
+
+        function updateTabButtons() {
+          document.getElementById("picker-tab-screen").classList.toggle("active", currentTab === "screen");
+          document.getElementById("picker-tab-window").classList.toggle("active", currentTab === "window");
+        }
+
+        function render() {
+          updateTabButtons();
+          const grid = document.getElementById("picker-grid");
+          grid.innerHTML = "";
+          const filtered = tilesForCurrentTab();
+          if (filtered.length === 0) {
+            const empty = document.createElement("div");
+            empty.className = "picker-empty";
+            empty.textContent = "共有できる項目がありません。";
+            grid.appendChild(empty);
+          }
+          for (const source of filtered) {
+            const tile = document.createElement("button");
+            tile.type = "button";
+            tile.className = "picker-tile" + (source.id === selectedId ? " selected" : "");
+            tile.setAttribute("data-picker-tile", "");
+            tile.setAttribute("data-source-id", source.id);
+            tile.setAttribute("data-source-name", source.name || "");
+            tile.setAttribute("data-source-type", source.type);
+            tile.addEventListener("click", () => {
+              selectedId = source.id;
+              render();
+            });
+
+            const img = document.createElement("img");
+            img.className = "picker-tile-thumb";
+            img.alt = source.name || "";
+            if (source.thumbnailDataUrl) img.src = source.thumbnailDataUrl;
+            tile.appendChild(img);
+
+            const label = document.createElement("div");
+            label.className = "picker-tile-label";
+            label.textContent = source.name || "";
+            tile.appendChild(label);
+
+            grid.appendChild(tile);
+          }
+          document.getElementById("picker-share").disabled = !selectedId;
+        }
+
+        function selectTab(tab) {
+          currentTab = tab;
+          selectedId = null;
+          render();
+        }
+
+        document.getElementById("picker-tab-screen").addEventListener("click", () => selectTab("screen"));
+        document.getElementById("picker-tab-window").addEventListener("click", () => selectTab("window"));
+
+        document.getElementById("picker-share").addEventListener("click", () => {
+          if (!selectedId) return;
+          window.selfmatrixSourcePicker.share({
+            sourceId: selectedId,
+            includeSystemAudio: document.getElementById("picker-system-audio").checked,
+          });
+        });
+        document.getElementById("picker-cancel").addEventListener("click", () => {
+          window.selfmatrixSourcePicker.cancel();
+        });
+
+        window.selfmatrixSourcePicker.onInit((payload) => {
+          sources = (payload && payload.sources) || [];
+          const audioAvailable = Boolean(payload && payload.audioAvailable);
+          document.getElementById("audio-row").style.display = audioAvailable ? "flex" : "none";
+          if (!audioAvailable) document.getElementById("picker-system-audio").checked = false;
+          // 既定タブ: 画面ソースがあれば「画面」、無ければ「ウィンドウ」。
+          currentTab = sources.some((source) => source.type === "screen") ? "screen" : "window";
+          selectedId = null;
+          render();
+        });
+      })();
+    </script>
+  </body>
+</html>

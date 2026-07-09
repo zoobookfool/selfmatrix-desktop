@@ -31,6 +31,13 @@ const {
   validateCallViewUrl,
 } = require("./widget-bridge-protocol.cjs");
 
+// M2 画面共有ソース選択 UI: 「選択されたソース + ピッカーの応答から setDisplayMediaRequestHandler()
+// の callback() 引数を解決する」ロジックは Electron に依存しない純関数として
+// source-picker-selection.cjs に切り出してある (widget-bridge-protocol.cjs と同じ方針)。
+// main.cjs (ここ) と、plain Node で完結する単体検証 probe (source-picker-selection-probe.cjs) の
+// 両方がこれを require する -- 判定ロジックの二重実装によるズレを防ぐ。
+const { resolveDisplayMediaSelection } = require("./source-picker-selection.cjs");
+
 // F1 (受け入れレビュー修正): smoke がハンドシェイク完了後に注入する偽メッセージの action 名。
 // widgetId をわざと WIDGET_ID と不一致にしてあるので validateWidgetBridgeMessage の
 // widget_id_mismatch で必ず拒否される想定 — 拒否されなければ (＝すり抜ければ) smoke は fail する。
@@ -133,7 +140,28 @@ if (isE2ERealJoin && app) {
   // getUserMedia() のデバイス選択ダイアログ/許可プロンプトを自動承認し、実マイク/カメラの
   // 代わりに合成 (fake) デバイスを使わせる。このワークスペースの絶対条件 (実オーディオ
   // デバイスを検証に使わない) を満たすための必須設定。dev/E2E 限定。
-  app.commandLine.appendSwitch("use-fake-ui-for-media-stream");
+  //
+  // M2 画面共有ソース選択 UI (レビュー指摘、実測で確定): 以前ここで使っていた
+  // `--use-fake-ui-for-media-stream` は Chromium の FakeMediaStreamUIProxy を有効化するが、この
+  // フェイク UI は getUserMedia() だけでなく getDisplayMedia() の権限/選択 UI も丸ごと横取りして
+  // 自動解決してしまう (実測: session.setDisplayMediaRequestHandler() のハンドラ関数自体が
+  // 一度も呼ばれないまま、fake な video+audio トラックで getDisplayMedia() が即座に resolve する
+  // -- Electron の setDisplayMediaRequestHandler は登録した瞬間に画面共有選択 UI を完全に肩代わり
+  // するはずだが、`--use-fake-ui-for-media-stream` が Electron のこのフックより先に短絡する)。
+  // native-callflow.e2e.mjs がネイティブソースピッカー (source-picker.html) を実際に開いて
+  // Playwright で操作する M2 の受け入れ要件と真っ向から矛盾する回帰だった (実バックエンドでの
+  // e2e:callflow 実行で発覚: sourcePicker.opened:false のまま screenshare 自体は fake track で
+  // 成立してしまっていた)。
+  // `--auto-accept-camera-and-microphone-capture` は getUserMedia() の camera/microphone 許可
+  // だけを自動承認する、より狭いスコープの Chromium フラグ (Chromium の
+  // kAutoAcceptCameraAndMicrophoneCapture switch)。実機検証したところ、この置き換えにより
+  // (a) getUserMedia() は従来どおり実プロンプト無しで fake device (下の
+  // `use-fake-device-for-media-stream` 由来) に即時解決し、(b) getDisplayMedia() は
+  // setDisplayMediaRequestHandler() のハンドラが確実に呼ばれ、ネイティブピッカーが実際に開く
+  // (callback() を呼ばずに放置すると Promise が解決せず保留され続けることも確認済み — フェイク
+  // UI による短絡が起きていないことの直接証拠)。dev/E2E 限定、本番ビルドではこの分岐自体に
+  // 到達しない。
+  app.commandLine.appendSwitch("auto-accept-camera-and-microphone-capture");
   app.commandLine.appendSwitch("use-fake-device-for-media-stream");
   // dev Matrix/LiveKit スタックは *.m.localhost (synapse.m.localhost, matrix-rtc.m.localhost,
   // synapse.othersite.m.localhost) を使う。curl はホスト名末尾の ".localhost" を DNS 問い合わせ
@@ -259,6 +287,10 @@ const state = {
   callWindow: null,
   callView: null,
   callViewState: "none",
+  // M2 画面共有ソース選択 UI: ネイティブピッカーウィンドウ (source-picker.html) の現在のインスタンス。
+  // cinny 用の mainWindow/callView とは完全に別系統 (別 preload、別 contextBridge 名前空間) --
+  // openSourcePicker()/createSourcePickerWindow() 参照。
+  sourcePickerWindow: null,
   // M1 step 3c-1: 現在アクティブな通話の widgetId (openCallView() が検証済み URL から読み取って
   // 設定する。closeCallView() でリセット)。from-view/to-view のバリデーションはこの値と照合する。
   // 未アクティブ時 (null) は NO_ACTIVE_WIDGET_ID センチネルと照合され必ず拒否される (fail-closed。
@@ -1543,57 +1575,181 @@ function setupIpc() {
   });
 }
 
+// M2 画面共有ソース選択 UI (Discord 風サムネイルピッカー + system audio トグル):
+//
+// 設計判断 (絶対条件、遵守): ソース選択 UI は cinny レンダラ内ダイアログにしない。cinny レンダラ
+// (未信頼な federated コンテンツを描画する) には画面キャプチャ能力を一切露出しない — desktop
+// 自身の信頼された HTML (source-picker.html) を、desktop 自身が生成する別の BrowserWindow に
+// ロードして表示する。ピッカー ⇔ main の通信は専用の preload (source-picker-preload.cjs、
+// window.selfmatrixSourcePicker) で行い、cinny 用の window.selfmatrixNative
+// (shell-preload.cjs、claimWidgetTransport のみ) とは完全に別系統 — この変更は
+// window.selfmatrixNative の契約を一切広げていない (cinny-shell-smoke の contractSurfaceGate が
+// 引き続き ["claimWidgetTransport"] のままであることで実証する)。
+//
+// 旧実装 (M1 step 3c-3 まで) は「最初の screen: ソースを無言で自動選択 (通常モード) /
+// "SelfMatrix" を名前に含む自 window を自動選択 (E2E、content-adaptive エンコーダ対策)」という
+// 暫定挙動だった。M2 でこのピッカーが実装されたことに伴い、両モードとも「本物のピッカーを開いて
+// ユーザー (または E2E スクリプト) の選択を待つ」経路に統一する — E2E も自動バイパスしない
+// (e2e/native-callflow.e2e.mjs の driveSourcePicker() が Playwright でピッカーを実際に操作し、
+// "SelfMatrix" を名前に含む自 window のタイルを選ぶことで、旧ヒューリスティックと同じ実質効果
+// (content-adaptive エンコーダに継続的な差分ソースを与える) を実ピッカー経由で再現する)。
+//
+// 1 リクエストにつき 1 ピッカーウィンドウ、多重には開かない (pendingSourcePickerRequest が
+// 既に埋まっていれば新規要求は即キャンセル扱いにする -- fail-closed)。
+let pendingSourcePickerRequest = null; // { resolve: (pickerResponse) => void } | null
+
+function resolvePendingSourcePickerRequest(response) {
+  const pending = pendingSourcePickerRequest;
+  if (!pending) return;
+  pendingSourcePickerRequest = null;
+  pending.resolve(response);
+}
+
+function closeSourcePickerWindow() {
+  const win = state.sourcePickerWindow;
+  state.sourcePickerWindow = null;
+  if (win && !win.isDestroyed()) win.destroy();
+}
+
+// sources (desktopCapturer.getSources() の生の結果、NativeImage 込み) と request
+// (setDisplayMediaRequestHandler のハンドラに渡される DisplayMediaRequest) からピッカー
+// ウィンドウを構築する。E2E offscreen モード (isE2ERealJoin) では e2eOffscreenBrowserWindowOptions()
+// により mainWindow/callWindow と同じ「実ウィンドウのまま画面外」に開く (E2E_OFFSCREEN_WINDOW_POSITION
+// コメント参照 -- WGC/desktopCapturer に影響しないことが実証済みの方式)。
+function createSourcePickerWindow(sources, request) {
+  const parent = state.mainWindow && !state.mainWindow.isDestroyed() ? state.mainWindow : undefined;
+  const win = new BrowserWindow({
+    title: "SelfMatrix - 画面を共有",
+    width: 780,
+    height: 580,
+    show: true,
+    parent,
+    modal: Boolean(parent),
+    autoHideMenuBar: true,
+    ...e2eOffscreenBrowserWindowOptions(),
+    webPreferences: {
+      preload: path.join(__dirname, "source-picker-preload.cjs"),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+  win.setMenuBarVisibility(false);
+  state.sourcePickerWindow = win;
+
+  // システム音声トグルは win32 かつ EC 自身が audio を要求したときだけ提示する (main.cjs の従来の
+  // 判定式 `request.audioRequested && process.platform === "win32"` をそのまま踏襲。実際に
+  // "loopback" を選ぶかどうかの最終判定は resolveDisplayMediaSelection() 一箇所に集約してある)。
+  const audioAvailable = Boolean(request.audioRequested) && process.platform === "win32";
+  const initPayload = {
+    audioAvailable,
+    sources: sources.map((source) => ({
+      id: source.id,
+      name: source.name,
+      type: source.id.startsWith("screen:") ? "screen" : "window",
+      thumbnailDataUrl:
+        source.thumbnail && typeof source.thumbnail.isEmpty === "function" && !source.thumbnail.isEmpty()
+          ? source.thumbnail.toDataURL()
+          : null,
+    })),
+  };
+
+  win.webContents.on("did-finish-load", () => {
+    if (state.sourcePickerWindow === win) win.webContents.send("source-picker:init", initPayload);
+  });
+
+  // OS のタイトルバー「閉じる」等、共有/キャンセル以外の経路でウィンドウが消えた場合もキャンセル
+  // 扱いにする (pendingSourcePickerRequest は share/cancel ハンドラで既に消費済みなら no-op)。
+  win.on("closed", () => {
+    if (state.sourcePickerWindow === win) state.sourcePickerWindow = null;
+    resolvePendingSourcePickerRequest({ canceled: true, reason: "window_closed" });
+  });
+
+  win.loadFile(path.join(__dirname, "source-picker.html"));
+  return win;
+}
+
+// sources/request からピッカー UI を実際に開き、ユーザーの選択 (または取消) を待つ。
+// 戻り値は resolveDisplayMediaSelection() の pickerResponse 引数の形そのもの
+// (source-picker-selection.cjs 参照)。
+function openSourcePicker(sources, request) {
+  return new Promise((resolve) => {
+    if (pendingSourcePickerRequest) {
+      // 多重に開かない: 既に別の要求を処理中なら、この新しい要求は無視 (キャンセル扱い) する。
+      resolve({ canceled: true, reason: "picker_already_open" });
+      return;
+    }
+    pendingSourcePickerRequest = { resolve };
+    createSourcePickerWindow(sources, request);
+  });
+}
+
+// ピッカーウィンドウ (source-picker-preload.cjs) からの応答用 IPC。cinny の mainWindow/call view は
+// この preload を一切ロードしないため、window.selfmatrixNative 経由ではこれらのチャンネルへ絶対に
+// 到達できない (contextBridge を介さない ipcMain チャンネル名自体は到達性を持たないが、念のため
+// event.sender を現在のピッカーウィンドウの webContents と突き合わせて多重防御する)。
+function setupSourcePickerIpc() {
+  ipcMain.on("source-picker:share", (event, selection) => {
+    if (!pendingSourcePickerRequest) return;
+    if (!state.sourcePickerWindow || event.sender !== state.sourcePickerWindow.webContents) return;
+    const sourceId = selection && typeof selection.sourceId === "string" ? selection.sourceId : null;
+    const includeSystemAudio = Boolean(selection && selection.includeSystemAudio);
+    resolvePendingSourcePickerRequest(
+      sourceId ? { canceled: false, sourceId, includeSystemAudio } : { canceled: true, reason: "no_source_selected" },
+    );
+    closeSourcePickerWindow();
+  });
+  ipcMain.on("source-picker:cancel", (event) => {
+    if (!pendingSourcePickerRequest) return;
+    if (!state.sourcePickerWindow || event.sender !== state.sourcePickerWindow.webContents) return;
+    resolvePendingSourcePickerRequest({ canceled: true, reason: "user_canceled" });
+    closeSourcePickerWindow();
+  });
+}
+
 // M1 step 3c-3 (受け入れレビューで発覚、修正): `setDisplayMediaRequestHandler` は Session
 // インスタンスごとに独立している。以前はここで `session.defaultSession` にしか登録しておらず、
 // これは mainWindow (cinny, パーティション未指定=デフォルトセッション) の getDisplayMedia() しか
 // カバーしない。call view (EC) は `CALL_VIEW_PARTITION` という**別の** session パーティションで
 // 動いている (createCallViewIfNeeded() 参照) ため、EC 側で実際に screenshare を開始した際の
 // getDisplayMedia() 要求は call view 自身のセッションのハンドラを探しに行き、登録が無ければ選択
-// ダイアログを試みて失敗する (E2E は `--use-fake-ui-for-media-stream` でメディア権限プロンプトは
-// 自動承認されるが、デスクトップキャプチャのソース選択はこの専用ハンドラでしか解決できない)。
-// 今までの smoke/cinny-shell-smoke はバックエンド無しで実 in-call UI に到達しないため、この
-// パーティション不一致は一度も顕在化していなかった。両方の session に同じロジックを登録する。
+// ダイアログを試みて失敗する。両方の session に同じロジックを登録する。
 function registerDisplayMediaHandler(targetSession) {
   targetSession.setDisplayMediaRequestHandler((request, callback) => {
     desktopCapturer
       .getSources({ types: ["screen", "window"], thumbnailSize: { width: 320, height: 180 } })
-      .then((sources) => {
-        // M1 step 3c-2 (native-callflow.e2e.mjs の実測で発覚): E2E 環境 (自動操作中で実マウス/
-        // 実画面の動きが乏しい dev マシン) では、素の実画面 ("screen:..." ソース) を掴むと
-        // screenshare 用の content-adaptive エンコーダが「変化なし」を検知してほぼ即座に
-        // フレーム送出を止める (実測: bytesSent が初回キーフレーム分だけ増えて完全に頭打ちに
-        // なった)。これはエンコーダの正しい挙動であり EC/native-prototype 側のバグではないが、
-        // 「配信中に media が流れ続けること」を E2E で実測する上では信号が消えてしまう。cinny 自身
-        // の window (タイトルに "SelfMatrix" を含む — cinny dist の <title> は "SelfMatrix",
-        // main.cjs 起動時の初期タイトルもこれと一致させてある) が候補にあれば、実画面より優先して
-        // それを掴む。native-callflow.e2e.mjs はこの window 上に絶えず変化する keep-alive
-        // オーバーレイを描画し、エンコーダに継続的な差分を与える。
-        //
-        // H2 (受け入れレビュー修正、major): この「自分自身の window を優先する」ヒューリスティックは
-        // 上記のとおり E2E 環境固有の対策であり、通常起動時にまで適用するとユーザーが選んだつもりの
-        // ない自分自身のウィンドウを無言で共有し始めてしまう (ユーザーの意図しない情報漏洩になり得る)。
-        // isE2ERealJoin (--e2e-real-join、dev/E2E 専用フラグ) の場合のみ有効にし、通常モードでは
-        // 「最初の screen: ソース、無ければ sources[0]」のフォールバックのみを使う (M2 でソース選択
-        // UI を実装するまでの暫定挙動)。
-        const ownWindow = isE2ERealJoin
-          ? sources.find((item) => item.name && item.name.includes("SelfMatrix"))
-          : null;
-        const source = ownWindow || sources.find((item) => item.id.startsWith("screen:")) || sources[0];
-        // 診断/evidence 用: どのソースが実際に選ばれたかを記録する (サムネイル画像などは積まない)。
+      .then((sources) =>
+        openSourcePicker(sources, request).then((pickerResponse) => ({ sources, pickerResponse })),
+      )
+      .then(({ sources, pickerResponse }) => {
+        const selection = resolveDisplayMediaSelection(sources, pickerResponse, { platform: process.platform });
+        // 診断/evidence 用: どのソースが実際に選ばれたか (または取消されたか) を記録する
+        // (サムネイル画像などの重い/機微なデータは積まない)。
         state.widgetMessages.push({
           t: Date.now(),
           type: "display-media-source-selected",
-          sourceId: source?.id ?? null,
-          sourceName: source?.name ?? null,
-          wasOwnWindow: Boolean(ownWindow),
+          sourceId: selection.video?.id ?? null,
+          sourceName: selection.video?.name ?? null,
+          canceled: selection.canceled,
+          cancelReason: selection.canceled ? selection.reason : null,
+          audioMode: selection.audio,
           availableSourceCount: sources.length,
         });
-        callback({
-          video: source,
-          audio: request.audioRequested && process.platform === "win32" ? "loopback" : false,
-        });
+        if (selection.canceled || !selection.video) {
+          callback({});
+          return;
+        }
+        callback({ video: selection.video, audio: selection.audio });
       })
-      .catch(() => callback({}));
+      .catch((error) => {
+        state.widgetMessages.push({
+          t: Date.now(),
+          type: "display-media-handler-error",
+          error: String(error && error.message ? error.message : error),
+        });
+        callback({});
+      });
   });
 }
 
@@ -1985,6 +2141,7 @@ async function runSmoke() {
     "utf8",
   );
 
+  state.sourcePickerWindow?.destroy();
   state.callWindow?.destroy();
   state.mainWindow?.destroy();
   state.server?.close();
@@ -2074,6 +2231,7 @@ async function runMemoryProbe() {
   };
   fs.mkdirSync(evidenceDir, { recursive: true });
   fs.writeFileSync(path.join(evidenceDir, "memory-result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  state.sourcePickerWindow?.destroy();
   state.callWindow?.destroy();
   state.mainWindow?.destroy();
   state.server?.close();
@@ -2506,6 +2664,7 @@ async function runCinnyShellSmoke() {
     "utf8",
   );
 
+  state.sourcePickerWindow?.destroy();
   state.callWindow?.destroy();
   state.mainWindow?.destroy();
   state.server?.close();
@@ -2705,6 +2864,7 @@ async function runTrayProbe() {
   fs.writeFileSync(path.join(evidenceDir, "tray-probe-result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
 
   state.tray?.destroy();
+  state.sourcePickerWindow?.destroy();
   state.callWindow?.destroy();
   if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
   state.server?.close();
@@ -2733,6 +2893,7 @@ async function main() {
   }
 
   setupIpc();
+  setupSourcePickerIpc();
   setupDisplayMediaHandler();
   setupE2EIntrospection();
   await startServer();

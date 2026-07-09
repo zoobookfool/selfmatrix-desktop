@@ -257,6 +257,111 @@ export async function openVoiceLoungeAndJoin(page, { log }, roomName = ROOM_NAME
   return { created, clickedJoin: true, reason: null };
 }
 
+// ---- M2 画面共有ソース選択 UI (ネイティブピッカー) を Playwright で駆動するヘルパー ----------------
+//
+// main.cjs の registerDisplayMediaHandler() は M2 でネイティブピッカー方式に変わった。E2E は
+// (自動バイパスせず) 実際にピッカーウィンドウを掴んで操作する -- native-callflow.e2e.mjs の
+// 旧「"SelfMatrix" を含む自 window を無言で自動選択する」ヒューリスティックと同じ実質効果を、
+// 実ピッカー UI 経由で再現する (content-adaptive エンコーダに継続的な差分ソースを与えるため)。
+//
+// ピッカーは source-picker.html + source-picker-preload.cjs (cinny 用の window.selfmatrixNative
+// とは完全に別系統) が実装する別の BrowserWindow で、以下のセレクタを持つ (main.cjs の
+// createSourcePickerWindow()/source-picker.html 参照):
+//   - タブ: #picker-tab-screen / #picker-tab-window
+//   - タイル: .picker-tile[data-source-id][data-source-name][data-source-type]
+//   - システム音声チェックボックス: #picker-system-audio (audioAvailable のときだけ表示される)
+//   - ボタン: #picker-share / #picker-cancel
+
+export async function waitForSourcePickerWindow(electronApp, { log }, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const page of electronApp.windows()) {
+      let url = "";
+      try {
+        url = page.url();
+      } catch {
+        continue;
+      }
+      if (url.includes("source-picker.html")) return page;
+    }
+    await wait(250);
+  }
+  log("waitForSourcePickerWindow: timed out waiting for the native source picker window to open.");
+  return null;
+}
+
+// ピッカーウィンドウを見つけ、`sourceNameContains` を名前に含むタイルを選択し (無ければ
+// ウィンドウ/画面タブを切り替えて再探索する)、`includeSystemAudio` が真ならシステム音声
+// チェックボックスを ON にしてから「共有」を押す。戻り値は診断用の実測フィールド一式。
+export async function driveSourcePicker(
+  electronApp,
+  { log },
+  { sourceNameContains = "SelfMatrix", includeSystemAudio = true, timeoutMs = 15000 } = {},
+) {
+  const page = await waitForSourcePickerWindow(electronApp, { log }, timeoutMs);
+  if (!page) {
+    return { opened: false, reason: "picker_window_not_found" };
+  }
+  log("source picker window opened -- driving it via Playwright.");
+
+  const tilesSeen = await page
+    .locator("[data-picker-tile]")
+    .first()
+    .waitFor({ state: "visible", timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+  if (!tilesSeen) {
+    return { opened: true, tilesSeen: false, sourceCount: 0, tileFound: false, reason: "no_tiles_rendered" };
+  }
+
+  const sourceCount = await page.locator("[data-picker-tile]").count();
+
+  const findTile = () => page.locator(`[data-picker-tile][data-source-name*="${sourceNameContains}"]`).first();
+  let tile = findTile();
+  let tileFound = (await tile.count()) > 0;
+  if (!tileFound) {
+    // 既定タブに対象が無ければ、もう一方のタブへ切り替えて再探索する (alice 自身の window は
+    // "window" タイプのソースであり、既定タブが "screen" のときはここに来る)。
+    await page.locator("#picker-tab-window").click().catch(() => {});
+    tile = findTile();
+    tileFound = await tile
+      .waitFor({ state: "visible", timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  if (!tileFound) {
+    return { opened: true, tilesSeen, sourceCount, tileFound: false, reason: "target_source_not_found" };
+  }
+
+  await tile.click();
+
+  const systemAudioCheckbox = page.locator("#picker-system-audio");
+  const systemAudioAvailable = await systemAudioCheckbox.isVisible().catch(() => false);
+  let systemAudioChecked = false;
+  if (systemAudioAvailable && includeSystemAudio) {
+    await systemAudioCheckbox.check().catch(() => {});
+    systemAudioChecked = await systemAudioCheckbox.isChecked().catch(() => false);
+  }
+
+  const shareEnabled = await page
+    .locator("#picker-share")
+    .isEnabled()
+    .catch(() => false);
+  await page.locator("#picker-share").click();
+
+  return {
+    opened: true,
+    tilesSeen,
+    sourceCount,
+    tileFound: true,
+    shareEnabled,
+    systemAudioAvailable,
+    systemAudioChecked,
+    shared: true,
+  };
+}
+
 // ---- main プロセス側の状態を electronApp.evaluate() 経由で覗くヘルパー ------------------------
 
 export async function getMainProcessSnapshot(electronApp) {

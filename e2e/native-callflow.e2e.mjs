@@ -49,6 +49,7 @@ import {
   checkBackendReachable,
   deepSanitize,
   dismissBlockingModals,
+  driveSourcePicker,
   evalInCallView,
   fromViewJoinObserved,
   getMainProcessSnapshot,
@@ -113,6 +114,26 @@ const RTP_STATS_SCRIPT = `(async () => {
     });
   }
   return { audioBytesReceived, videoBytesReceived, videoBytesSent, audioBytesSent, pcCount: pcs.length };
+})()`;
+
+// M2 画面共有ソース選択 UI: 「システム音声トグル ON で audio track が乗ったこと」を実測するための
+// スクリプト。RTP_STATS_SCRIPT (bytesSent/bytesReceived の累積カウンタ) は alice の通常の
+// マイク音声も screenshare のシステム音声も区別なく合算してしまうため、代わりに現在 "live" な
+// audio/video sender の本数を数える -- ピッカーでシステム音声を ON にした screenshare 開始の
+// 前後でこの本数を比較し、audio sender が実際に増えたことを確認する。
+const SENDER_KIND_COUNT_SCRIPT = `(() => {
+  const pcs = window.__selfmatrixPcs || [];
+  let audio = 0;
+  let video = 0;
+  for (const r of pcs) {
+    if (!r._pc || typeof r._pc.getSenders !== "function") continue;
+    for (const sender of r._pc.getSenders()) {
+      if (!sender.track || sender.track.readyState !== "live") continue;
+      if (sender.track.kind === "audio") audio += 1;
+      if (sender.track.kind === "video") video += 1;
+    }
+  }
+  return { audio, video };
 })()`;
 
 // M1 step 3c-3 (実機確認して判明): `MediaView.tsx` 自体は root 要素に
@@ -239,6 +260,69 @@ async function getDomAriaPressed(alicePage, testid) {
   return locator.first().getAttribute("aria-pressed");
 }
 
+// M2 画面共有ソース選択 UI: screenshare を開始すると main.cjs のネイティブピッカーが実際に開く
+// (registerDisplayMediaHandler()、旧来の「E2E は自 window を無言で自動選択する」ヒューリスティックは
+// このコミットで撤去され、E2E も本物のピッカーを Playwright で操作する経路に一本化された)。
+// invokeAliceCallControl() 自体は call-control-preload.cjs の handleToggleScreenshare() が
+// target.click() を同期的に呼んで即座に返す (EC 自身の getDisplayMedia() 解決は待たない) ため、
+// invoke の Promise とピッカーを掴んで操作する処理は並行して進める -- ピッカーが開く前に
+// invoke だけ待ってしまうと、この後の wait(1200) 相当の猶予の間にピッカーが開いたままになり
+// 待機がタイムアウトしてしまう。
+//
+// この関数は「toggleScreenshare 語彙の実証」と「M2 ネイティブピッカー自体の実証」を兼ねる:
+// ピッカーが開いたこと・ソース一覧が非空であること・"SelfMatrix" タイルを選んで共有できたこと・
+// システム音声トグル ON で実際に audio sender が増えたこと (available なとき) を実測する。
+async function toggleScreenshareViaNativePicker(aliceApp, alicePage) {
+  // 実 getDisplayMedia() が動き出す前に、キャプチャ対象になる cinny 自身の window 上へ
+  // keep-alive オーバーレイを仕込んでおく (main.cjs の registerDisplayMediaHandler コメント、
+  // startKeepAliveOverlay() コメント参照)。
+  await startKeepAliveOverlay(alicePage);
+  const before = await getDomAriaPressed(alicePage, "call_control_screenshare");
+  const sendersBefore = (await evalInCallView(aliceApp, SENDER_KIND_COUNT_SCRIPT)).value ?? { audio: 0, video: 0 };
+  const t0 = Date.now();
+
+  const invokePromise = invokeAliceCallControl(aliceApp, "toggleScreenshare");
+  const sourcePicker = await driveSourcePicker(aliceApp, { log }, { includeSystemAudio: true });
+  const invoke = await invokePromise;
+
+  await wait(1500);
+  const push = await latestStatePush(aliceApp, t0);
+  const after = await getDomAriaPressed(alicePage, "call_control_screenshare");
+  const sendersAfter = (await evalInCallView(aliceApp, SENDER_KIND_COUNT_SCRIPT)).value ?? { audio: 0, video: 0 };
+
+  const screenshareStarted =
+    Boolean(invoke.ok && invoke.result && invoke.result.ok === true) &&
+    Boolean(push && push.screenshare === true) &&
+    after === "true";
+
+  // systemAudioTrackAdded は systemAudioAvailable (=EC がこの getDisplayMedia 要求で
+  // audioRequested:true を送ってきた、win32 限定) のときだけ意味を持つ。この EC ビルドが
+  // audioRequested:true を送らない環境では null のまま (pass のスコープ外にする -- toggleReactions
+  // 等の既知の環境ギャップと同じ「実在しない前提条件はスコープ外」パターン、runCallControlVocabulary()
+  // コメント参照)。
+  const systemAudioTrackAdded = sourcePicker.systemAudioAvailable ? sendersAfter.audio > sendersBefore.audio : null;
+
+  return {
+    before,
+    after,
+    invoke,
+    statePush: push,
+    screenshareStarted,
+    sourcePicker,
+    sendersBefore,
+    sendersAfter,
+    systemAudioTrackAdded,
+    pass:
+      Boolean(sourcePicker.opened) &&
+      Boolean(sourcePicker.tilesSeen) &&
+      (sourcePicker.sourceCount ?? 0) > 0 &&
+      Boolean(sourcePicker.tileFound) &&
+      Boolean(sourcePicker.shared) &&
+      screenshareStarted &&
+      (systemAudioTrackAdded === null || systemAudioTrackAdded === true),
+  };
+}
+
 // M1 step 3c-3: 7 語彙のうち screenshare/spotlight/emphasis/sound は onCallControlState の
 // push で main.cjs 側 (callControlMessages) にも、cinny 自身の再描画 (aria-pressed) にも実際に
 // 反映されることを二重に確認する。settings/reactions は CallControlState に対応フィールドが
@@ -246,28 +330,18 @@ async function getDomAriaPressed(alicePage, testid) {
 // (call-control-preload.cjs 冒頭コメント、cinny の NativeCallControl.ts 参照)。
 async function runCallControlVocabulary(aliceApp, alicePage) {
   const vocabulary = {};
+  let sourcePickerVerification = null;
 
-  // 1. toggleScreenshare — 配信を開始する (この後の窓移動テストでも ON のまま使う)。
+  // 1. toggleScreenshare — 配信を開始する (この後の窓移動テストでも ON のまま使う)。M2: ネイティブ
+  //    ソースピッカー経由 (toggleScreenshareViaNativePicker() 参照、ピッカー自体の実証も兼ねる)。
   {
-    // 実 getDisplayMedia() が動き出す前に、キャプチャ対象になる cinny 自身の window 上へ
-    // keep-alive オーバーレイを仕込んでおく (main.cjs の registerDisplayMediaHandler コメント、
-    // startKeepAliveOverlay() コメント参照)。
-    await startKeepAliveOverlay(alicePage);
-    const before = await getDomAriaPressed(alicePage, "call_control_screenshare");
-    const t0 = Date.now();
-    const invoke = await invokeAliceCallControl(aliceApp, "toggleScreenshare");
-    await wait(1200);
-    const push = await latestStatePush(aliceApp, t0);
-    const after = await getDomAriaPressed(alicePage, "call_control_screenshare");
+    sourcePickerVerification = await toggleScreenshareViaNativePicker(aliceApp, alicePage);
     vocabulary.toggleScreenshare = {
-      invoke,
-      before,
-      after,
-      statePush: push,
-      pass:
-        Boolean(invoke.ok && invoke.result && invoke.result.ok === true) &&
-        Boolean(push && push.screenshare === true) &&
-        after === "true",
+      invoke: sourcePickerVerification.invoke,
+      before: sourcePickerVerification.before,
+      after: sourcePickerVerification.after,
+      statePush: sourcePickerVerification.statePush,
+      pass: sourcePickerVerification.screenshareStarted,
     };
   }
 
@@ -438,7 +512,7 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
   }
 
   const pass = Object.values(vocabulary).every((entry) => entry.pass);
-  return { vocabulary, pass };
+  return { vocabulary, pass, sourcePickerVerification };
 }
 
 // SelfMatrix M1 全体レビュー (Fable) test-critical #3 対応: runCallControlVocabulary() の 7 語彙
@@ -862,6 +936,10 @@ async function verifyMidCallSettingsSync(alicePage, aliceApp) {
   await alicePage.locator(`[data-testid="ssq_${MID_CALL_SETTINGS_SYNC_VALUES.quality}"]`).click();
   await alicePage.locator(`[data-testid="ssf_${MID_CALL_SETTINGS_SYNC_VALUES.fps}"]`).click();
   await alicePage.locator('[data-testid="ss_start"]').click();
+  // M2 画面共有ソース選択 UI: この「配信を開始」クリックが新しい getDisplayMedia() 要求を起こし、
+  // 実ピッカーが開く (バイパスしない) -- 選ばないと getDisplayMedia が解決せず afterOn が
+  // 永遠に反転しないため、ここで実際に操作する。
+  const midCallPicker = await driveSourcePicker(aliceApp, { log }, { includeSystemAudio: true });
   await wait(1500);
   const afterOn = await screenshareButton.getAttribute("aria-pressed").catch(() => null);
 
@@ -883,14 +961,20 @@ async function verifyMidCallSettingsSync(alicePage, aliceApp) {
     afterOff,
     afterOn,
     readBackFromCallView: readBack,
+    midCallPicker,
     note:
       "Drives cinny's own ScreenShareButton + quality/fps picker (Controls.tsx) via real clicks on " +
       "alicePage, so this actually exercises NativeCallControl.toggleScreenshare()'s live resync " +
       "(collectNativeCallLocalStorageSnapshot() -> transport.updateCallLocalStorage(), awaited " +
       "before the callControlInvoke() RPC click) -- unlike runCallControlVocabulary()'s " +
       "toggleScreenshare check, which bypasses cinny's TS layer entirely via " +
-      "global.__selfmatrixE2E.invokeCallControl().",
-    pass: afterOff === "false" && afterOn === "true" && matched,
+      "global.__selfmatrixE2E.invokeCallControl(). M2: the re-share click above opens the native " +
+      "source picker (registerDisplayMediaHandler()) -- driveSourcePicker() drives it for real.",
+    pass:
+      afterOff === "false" &&
+      afterOn === "true" &&
+      matched &&
+      Boolean(midCallPicker.opened && midCallPicker.shared),
   };
 }
 
@@ -1007,6 +1091,9 @@ async function runCallRespawn(aliceApp, alicePage) {
     await alicePage.locator('[data-testid="ssq_720"]').click();
     await alicePage.locator('[data-testid="ssf_30"]').click();
     await alicePage.locator('[data-testid="ss_start"]').click();
+    // M2 画面共有ソース選択 UI: 通話跨ぎ後の再共有もネイティブピッカーを実際に経由する
+    // (バイパスしない -- 選ばないと getDisplayMedia が解決せず after が反転しない)。
+    const respawnPicker = await driveSourcePicker(aliceApp, { log }, { includeSystemAudio: true });
     await wait(1500);
     const after = await getDomAriaPressed(alicePage, "call_control_screenshare");
     const snapshot = await getMainProcessSnapshot(aliceApp);
@@ -1022,7 +1109,12 @@ async function runCallRespawn(aliceApp, alicePage) {
       after,
       pushCount: pushesSinceClick.length,
       pushes: pushesSinceClick,
-      pass: before !== after && after === "true" && pushesSinceClick.length === 1,
+      respawnPicker,
+      pass:
+        before !== after &&
+        after === "true" &&
+        pushesSinceClick.length === 1 &&
+        Boolean(respawnPicker.opened && respawnPicker.shared),
     };
   }
 
@@ -1316,6 +1408,20 @@ async function main() {
     result.passConditions.callControlVocabulary = callControlResult;
     log(`callControlVocabulary.pass=${callControlResult.pass}`);
 
+    // ---- 5.1 M2 画面共有ソース選択 UI: ネイティブピッカーが実際に開いたこと・ソース一覧が非空・
+    //          "SelfMatrix" タイルを選んで共有できたこと・システム音声トグル ON で audio track が
+    //          乗ったことを実測する (上の toggleScreenshare 語彙検証と同じ操作から得られた結果を
+    //          再利用する -- 二重に screenshare を開始しない)。--------------------------------
+    const sourcePickerVerification = callControlResult.sourcePickerVerification;
+    result.passConditions.sourcePicker = sourcePickerVerification;
+    const pickerUi = sourcePickerVerification?.sourcePicker;
+    log(
+      `sourcePicker: opened=${pickerUi?.opened} sourceCount=${pickerUi?.sourceCount} ` +
+        `tileFound=${pickerUi?.tileFound} shared=${pickerUi?.shared} ` +
+        `systemAudioAvailable=${pickerUi?.systemAudioAvailable} ` +
+        `systemAudioTrackAdded=${sourcePickerVerification?.systemAudioTrackAdded} pass=${sourcePickerVerification?.pass}`,
+    );
+
     // ---- 5.5 M1 全体レビュー test-critical #3: spotlight/emphasis/settings/sound を cinny 自身の
     //          実 UI クリックで駆動する (screenshare は下の H3 ステップで、reactions は cinny 側に
     //          ボタンが無いため対象外)。-------------------------------------------------------
@@ -1398,6 +1504,7 @@ async function main() {
       result.passConditions.boundsSync.pass &&
       result.passConditions.localStorageContract.pass &&
       result.passConditions.callControlVocabulary.pass &&
+      Boolean(result.passConditions.sourcePicker?.pass) &&
       result.passConditions.realClickVocabulary.pass &&
       result.passConditions.midCallSettingsSync.pass &&
       result.passConditions.bobWatchOptIn.ok &&
