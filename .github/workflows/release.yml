@@ -1,0 +1,201 @@
+# M2 3c: リリース CI (半自動)。正本は selfmatrix-workspace の design/release-pipeline.md §6。
+#
+# このワークフローがやること: NSIS インストーラのビルド + Artifact Attestation 発行 +
+# SHA256SUMS 生成 + ドラフトリリース作成、まで。
+#
+# **このワークフローが絶対にやらないこと (design §0/§5/§6 の肝)**:
+#   - minisign 署名はしない。秘密鍵 (selfmatrix.sec) は運用者の手元オフライン鍵であり、
+#     CI にも GitHub Secrets にも一切置かない。署名は運用者が手元で行い、.minisig を
+#     ドラフトリリースへ手動添付してから publish する (このファイル末尾のコメント参照)。
+#   - リリースを publish しない。ここで作るのは draft のみ (softprops/action-gh-release の
+#     draft: true)。公開は運用者の手動操作。
+#
+# 実行トリガー: 保護タグ (protected tag) 運用を前提とした `v*` タグ push
+# (design §3 層 1「基本衛生」— protected tag は GitHub リポジトリ設定側で別途有効化すること、
+# このワークフロー自体はタグ保護を強制できない)。
+on:
+  push:
+    tags:
+      - "v*"
+
+# 最小権限 (design §3 層 1)。ここに列挙していないスコープは既定で none になる。
+permissions:
+  contents: write # ドラフトリリースの作成 + アセットのアップロード
+  id-token: write # Artifact Attestation (Sigstore OIDC) の発行に必要
+  attestations: write # 発行した attestation をリポジトリに紐付ける
+
+jobs:
+  build:
+    # NSIS ビルドと electron-builder の Windows ターゲットには Windows ランナーが要る。
+    runs-on: windows-latest
+
+    env:
+      # cinny/element-call のどのブランチを同梱するか。CLAUDE.md (DiscordSub ワークスペース) と
+      # native-milestones.md M2 節が正本: cinny は native シェル統合済みの product ブランチ、
+      # element-call も同じく product ブランチ (どちらも `product/discord-style-shell`)。
+      #
+      # TODO(リリース時に要確認・再現性のため推奨): ブランチ名 (可変参照) のままだと、同じタグを
+      # 再ビルドしたときに同梱物が変わりうる (ブランチ先端が動いていれば別コミットを拾う)。
+      # 本番リリース運用に入ったら、実際にタグを切る直前の cinny/element-call の HEAD SHA を確認し、
+      # このブランチ名を SHA (例: "a1b2c3d...") に固定することを推奨 (design §6 のコメントと同じ注記)。
+      # 当面 (M2 3c 時点) はブランチ名のままで進める。
+      CINNY_REF: product/discord-style-shell
+      ELEMENT_CALL_REF: product/discord-style-shell
+      # cinny (.node-version: 24.13.1) と element-call (.node-version: 24) の両方が Node 24 系を
+      # 指定しているため、ビルド全体を単一の Node 24 で揃える。
+      NODE_VERSION: "24"
+      # element-call の packageManager 指定 (element-call/package.json の "packageManager":
+      # "pnpm@10.33.0") と同一のバージョンを固定する。corepack 経由 (`corepack enable`) ではなく
+      # pnpm/action-setup で明示バージョン指定するのは、corepack のシグネチャ検証まわりで過去に
+      # 発生した破損 (鍵ローテーション起因の CI 障害) を避けるための意図的選択。CLAUDE.md が書く
+      # ローカル開発手順 (corepack) と CI での担保手段が違うだけで、結果として使われる pnpm の
+      # バージョンは同一になる。
+      PNPM_VERSION: "10.33.0"
+
+    steps:
+      # --- checkout: sibling レイアウトを CI 上で再現する ---
+      # actions/checkout の `path:` は $GITHUB_WORKSPACE 配下の相対パス。path を明示指定した
+      # 3 つの checkout を並べることで、$GITHUB_WORKSPACE/{selfmatrix-desktop,cinny,element-call}
+      # という兄弟ディレクトリ構成になる。これは electron-builder.yml の extraResources
+      # (`../cinny/dist`, `../element-call/dist`) が前提とするレイアウトと同一
+      # (README.md「開発手順」の sibling checkout と同じ形)。
+      - name: Checkout selfmatrix-desktop
+        uses: actions/checkout@v5
+        with:
+          path: selfmatrix-desktop
+
+      # cinny / element-call は zoobookfool 配下の別リポジトリ (公開リポジトリ前提 -- 既定の
+      # GITHUB_TOKEN には他リポジトリへの書き込み権限は無いが、対象が public repo であれば
+      # checkout の read アクセスに追加の PAT は不要)。
+      # 要確認: cinny/element-call が実際に public であること (private の場合はこの checkout が
+      # 403 で失敗する -- その場合は別途 PAT/deploy key を Secrets に追加する必要があるが、
+      # それは本タスクのスコープ外)。
+      - name: Checkout cinny (${{ env.CINNY_REF }})
+        uses: actions/checkout@v5
+        with:
+          repository: zoobookfool/selfmatrix-cinny
+          ref: ${{ env.CINNY_REF }}
+          path: cinny
+
+      - name: Checkout element-call (${{ env.ELEMENT_CALL_REF }})
+        uses: actions/checkout@v5
+        with:
+          repository: zoobookfool/selfmatrix-element-call
+          ref: ${{ env.ELEMENT_CALL_REF }}
+          path: element-call
+
+      # --- ツールチェイン ---
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # cinny/desktop は npm、element-call は pnpm。setup-node のビルトインキャッシュは
+          # 複数リポジトリ・複数パッケージマネージャ構成で lockfile パスの指定が煩雑になるため
+          # 使わない (キャッシュ無しでも正しさには影響しない。速度最適化は本タスクの範囲外)。
+
+      - name: Set up pnpm (for element-call)
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # element-call の package.json スクリプト (例: build:full が展開する
+      # "NODE_OPTIONS=--max-old-space-size=16384 vite build ...") は POSIX の
+      # `VAR=value command` 構文を使っている。Windows で pnpm/npm がスクリプトを実行する既定シェル
+      # (cmd.exe) はこの構文を解釈できずコマンド解決エラーになる (CLAUDE.md
+      # 「Windows での注意」節: 「PowerShell ではなく Git Bash から実行してください」の実体)。
+      # windows-latest ランナーには Git Bash が同梱されている (`C:\Program Files\Git\bin\bash.exe`)。
+      # このステップの `shell: bash` はワークフロー run ステップ自体の解釈シェルを切り替えるだけで、
+      # pnpm が内部でスクリプト文字列を実行する際のシェル選択には影響しない可能性があるため、
+      # pnpm 自体の scriptShell 設定を明示的に Git Bash へ固定する (念のための二重の対策)。
+      - name: Point pnpm scriptShell at Git Bash (element-call scripts use POSIX env-var syntax)
+        working-directory: element-call
+        shell: bash
+        run: pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
+
+      # --- cinny: native ビルド ---
+      # **必ず build:native (`vite build --mode native`) を使う。通常の build (web ビルド) では
+      # native シェル検出コード (window.selfmatrixNative 検出) が tree-shake で除去されており、
+      # このリポジトリ (native シェル) と組み合わせても通話ホストが成立しない**
+      # (README.md「開発手順」参照)。
+      - name: "cinny: npm ci"
+        working-directory: cinny
+        run: npm ci
+
+      - name: "cinny: build (native mode -> cinny/dist)"
+        working-directory: cinny
+        run: npm run build:native
+
+      # --- element-call: embedded (ウィジェット専用) ビルド ---
+      - name: "element-call: pnpm install"
+        working-directory: element-call
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: "element-call: build (embedded -> element-call/dist)"
+        working-directory: element-call
+        shell: bash
+        run: pnpm build:embedded
+
+      # --- desktop: 依存関係 + electron-builder ---
+      - name: "desktop: npm ci"
+        working-directory: selfmatrix-desktop
+        run: npm ci
+
+      # electron-builder.yml の extraResources が ../cinny/dist と ../element-call/dist を
+      # asar の外 (process.resourcesPath 直下) へコピーして同梱する。--publish never で
+      # electron-builder 自身による GitHub への自動アップロード/公開は起こさない
+      # (アップロードはこのワークフローの後段ステップが行う)。署名は一切行わない
+      # (Authenticode コード署名はしない方針 -- electron-builder.yml 冒頭コメント / design §1)。
+      - name: "desktop: electron-builder (NSIS installer, publish=never)"
+        working-directory: selfmatrix-desktop
+        run: npx electron-builder --win nsis --publish never
+
+      # --- 配布物の完全性: 層 2 (Artifact Attestation) ---
+      # 検証は運用者/受け取り手が `gh attestation verify <file> --repo zoobookfool/selfmatrix-desktop`
+      # で行う (design §3 層 2 / §8)。
+      - name: Attest build provenance (installer)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: selfmatrix-desktop/dist/*.exe
+
+      # --- 配布物の完全性: 層 3 (SHA256SUMS) ---
+      # installer 本体 + blockmap (差分更新用) + latest.yml (electron-updater が読むメタ) を対象に
+      # 生成する。運用者はこの SHA256SUMS の中身を Matrix 運用ルームにも掲示する (out-of-band 掲示、
+      # design §3 層 3 -- この掲示はワークフローの外、運用者の手動作業)。
+      - name: Generate SHA256SUMS
+        working-directory: selfmatrix-desktop/dist
+        shell: bash
+        run: |
+          sha256sum SelfMatrix-Setup-*.exe SelfMatrix-Setup-*.exe.blockmap latest.yml > SHA256SUMS
+          cat SHA256SUMS
+
+      # --- ドラフトリリース作成 (publish しない) ---
+      # tag_name は既定で github.ref_name (push されたタグ名) になる。draft: true のため、
+      # ここで作られるリリースは「運用者が publish ボタンを押すまで一般には見えない」状態。
+      # 署名 (.minisig) はここでは添付しない -- 運用者が手元で minisign 署名した後、
+      # GitHub の Web UI (またはこの gh release と同じ操作) で手動アップロードする
+      # (RELEASING.md のリリース手順を参照)。
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            selfmatrix-desktop/dist/SelfMatrix-Setup-*.exe
+            selfmatrix-desktop/dist/SelfMatrix-Setup-*.exe.blockmap
+            selfmatrix-desktop/dist/latest.yml
+            selfmatrix-desktop/dist/SHA256SUMS
+
+# --- ここから先は CI の外、運用者の手動作業 (design §5-4 / §6 / RELEASING.md) ---
+#
+#   1. 上のジョブが作ったドラフトリリースから installer (.exe) をダウンロードする。
+#   2. 手元のオフライン環境で minisign 署名する:
+#        minisign -S -s selfmatrix.sec -m SelfMatrix-Setup-x.y.z.exe
+#      (秘密鍵 selfmatrix.sec は運用者の手元のみに存在し、このリポジトリにも GitHub Secrets にも
+#      一切コミット/登録しない -- design §5 の運用者鍵生成ランブック参照)
+#   3. 生成された `SelfMatrix-Setup-x.y.z.exe.minisig` をドラフトリリースへ手動でアップロードする。
+#   4. 初回の実署名時のみ: RELEASING.md の「初回実署名時の必須チェック」を実施してから publish する
+#      (アプリ内 minisign 検証器 (src/minisign-verify.cjs) が実 minisign の出力を正しく検証できる
+#      ことの最終確認。design §5-4)。
+#   5. ドラフトリリースを publish する (ここで初めて一般公開される。electron-updater は
+#      published なリリースの latest.yml しか見ないため、公開タイミング = 配布開始とみなせる)。
