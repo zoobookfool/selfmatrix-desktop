@@ -18,17 +18,15 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { verifyMinisign } = require("./minisign-verify.cjs");
 
-// TODO(運用者の実鍵生成後に差し替え): これはテスト用のプレースホルダ公開鍵であり、
-// 対応する秘密鍵は誰も持っていない (全 byte 0 の Ed25519 公開鍵 + 全 byte 0 の key_id — 構造的には
-// 正しい minisign 公開鍵ファイルとしてパースできるが、意味のある鍵ではない)。このままでは
-// どんな .minisig を渡しても "signature verification failed" 等で必ず拒否される
-// (= フェイルクローズ: 実鍵を埋め込むまでは自動更新の適用が一切通らない安全側の既定値)。
-// 運用者が design/release-pipeline.md §5 の手順でオフラインに Ed25519 鍵ペアを生成したら、
-// `<name>.pub` の中身 (2 行のテキスト) でこの定数を丸ごと置き換える。
-// 公開鍵は秘密情報ではないため、差し替え後もリポジトリにコミットして問題ない
-// (design/release-pipeline.md §5-2)。
-const RELEASE_PUBLIC_KEY = `untrusted comment: PLACEHOLDER - selfmatrix release public key (replace after operator key generation)
-RWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+// SelfMatrix リリース更新検証用の公開鍵 (Ed25519、minisign 形式)。key_id = 671E2DDA2737FAE3。
+// 運用者が 2026-07-09 にオフラインで生成した鍵ペアの公開鍵側。対応する秘密鍵
+// (minisign.key) は運用者の手元のみに存在し、このリポジトリにも GitHub Secrets にも CI にも
+// 置かない (design/release-pipeline.md §5)。公開鍵は秘密情報ではないためコミットして問題ない。
+// この鍵で署名されていない (= 運用者の秘密鍵で署名されていない) 更新物は
+// verifyUpdateCodeSignature が拒否する — GitHub アカウントが乗っ取られても、この秘密鍵が
+// 無ければ自動更新経由で改造バイナリを配れない、という「GitHub 非依存の信頼の根」。
+const RELEASE_PUBLIC_KEY = `untrusted comment: minisign public key 671E2DDA2737FAE3
+RWTj+jcn2i0eZ0jv7Ggj7q6CHh735wm6FcyjqWDEkaeJP6zP/tw2Vc0W
 `;
 
 // installer のパスから隣接する `<installer>.minisig` を読み、{ ok:true, fileBytes, sigText } か

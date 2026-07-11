@@ -2,9 +2,9 @@
 // M2 minisign 署名検証: update-signature-verify.cjs (electron-updater の verifyUpdateCodeSignature
 // フック雛形) の単体検証 probe。plain node 上で完結する (fs/crypto のみ、Electron 非依存)。
 //
-// RELEASE_PUBLIC_KEY (モジュール内の既定プレースホルダ定数) に対応する秘密鍵は誰も持っていない
-// ため、既定のまま "正当な署名 -> null" を確かめることはできない (これはフェイルクローズとして
-// 意図した挙動)。そのため createVerifyUpdateCodeSignature(publicKeyText) ファクトリへ、この probe
+// RELEASE_PUBLIC_KEY (モジュール内の既定定数 = 運用者の実公開鍵) に対応する秘密鍵は運用者の手元に
+// しか無いため、この probe から "正当な署名 -> null" を確かめることはできない (probe は運用者の
+// 秘密鍵を持たない = フェイルクローズの確認になる)。そのため createVerifyUpdateCodeSignature(publicKeyText) ファクトリへ、この probe
 // が使い捨てで生成した Ed25519 テスト鍵を注入し、同一のロジック (実運用と全く同じコードパス) を
 // テスト鍵で end-to-end 検証する。秘密鍵はプロセス内で生成され、どこにも書き出さない
 // (「テスト鍵の秘密鍵をコミットしない」絶対条件を満たす — ソース上に鍵材料が literal で
@@ -122,13 +122,23 @@ try {
     const resultMissingInstaller = await verifyWithTestKey(["SelfMatrix"], path.join(tmpDir, "does-not-exist.exe"));
     check("missing_installer_returns_error_string", typeof resultMissingInstaller === "string" && resultMissingInstaller.includes("not found"), true);
 
-    // 6. デフォルトエクスポート (RELEASE_PUBLIC_KEY を使う既定インスタンス) はプレースホルダのため
-    //    誰も対応する秘密鍵を持っておらず、正当な署名を用意できない = 必ず拒否される
-    //    (フェイルクローズであることの確認。実鍵に差し替わるまでは自動更新が絶対に通らない)。
+    // 6. デフォルトエクスポート (RELEASE_PUBLIC_KEY = 運用者の実公開鍵を使う既定インスタンス) は、
+    //    このテストが用意する署名 (probe 自身が生成したテスト鍵で署名したもの) を必ず拒否する。
+    //    運用者の秘密鍵で署名されていない更新物は通らない = フェイルクローズであることの確認。
     const { verifyUpdateCodeSignature: defaultVerify } = require("./update-signature-verify.cjs");
-    const resultDefaultPlaceholder = await defaultVerify(["SelfMatrix"], installerPath);
-    check("default_placeholder_key_always_rejects", typeof resultDefaultPlaceholder === "string" && resultDefaultPlaceholder.length > 0, true);
-    check("release_public_key_placeholder_is_all_zero_marker", RELEASE_PUBLIC_KEY.includes("PLACEHOLDER"), true);
+    const resultDefaultRejectsNonOperatorSig = await defaultVerify(["SelfMatrix"], installerPath);
+    check("default_key_rejects_non_operator_signature", typeof resultDefaultRejectsNonOperatorSig === "string" && resultDefaultRejectsNonOperatorSig.length > 0, true);
+
+    // 7. RELEASE_PUBLIC_KEY に**実鍵が埋め込まれている**ことのガード (プレースホルダへの誤 revert /
+    //    空鍵の混入を検知)。構造的に妥当な minisign 公開鍵で、key_id が非ゼロであることを確認する。
+    const { parsePublicKey } = require("./minisign-verify.cjs");
+    const parsedReleaseKey = parsePublicKey(RELEASE_PUBLIC_KEY);
+    const releaseKeyIsReal =
+      !RELEASE_PUBLIC_KEY.includes("PLACEHOLDER") &&
+      !parsedReleaseKey.reason &&
+      Buffer.isBuffer(parsedReleaseKey.keyId) &&
+      !parsedReleaseKey.keyId.every((b) => b === 0);
+    check("release_public_key_is_real_embedded_key", releaseKeyIsReal, true);
 
     finish();
   })().catch((err) => {
