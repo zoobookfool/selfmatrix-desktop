@@ -249,6 +249,32 @@ if (isM3CloseSpike) {
   });
 }
 
+// M3 step 1/2 (design/m3-window-ux.md §2 サブステップ 1/2、契約拡張 + close=復帰 production 化 +
+// 窓サイズ/位置記憶) の検証専用モード。runM3CloseSpikeProbe() (--m3-close-spike, 上) は「close-
+// preserve 方式そのものが無再接続復帰を成立させるか」という step 0 の最大リスクの実測に特化して
+// おり、popoutCallView()/popinCallView() の claim-once contract 経由の呼び出し (window.
+// selfmatrixNative.claimWidgetTransport() → ipcRenderer.invoke() → main の IPC ハンドラ →
+// detachCallView()/attachCallView())、onCallViewPlacement() push、callWindow の bounds 永続化は
+// 対象外だった。runM3WindowProbe() はこれらの production 経路を実際に駆動して検証する
+// (「記録だけ」を禁じるタスク要件どおり、直呼びではなく contract 経由で行う)。
+const isM3WindowProbe = process.argv.includes("--m3-window-probe");
+if (isM3WindowProbe) {
+  process.on("uncaughtException", (error) => {
+    state.m3WindowProbeAsyncErrors.push({
+      t: Date.now(),
+      type: "uncaughtException",
+      error: String(error && error.message ? error.message : error),
+    });
+  });
+  process.on("unhandledRejection", (reason) => {
+    state.m3WindowProbeAsyncErrors.push({
+      t: Date.now(),
+      type: "unhandledRejection",
+      error: String(reason && reason.message ? reason.message : reason),
+    });
+  });
+}
+
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
 // smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
@@ -263,8 +289,23 @@ if (isM3CloseSpike) {
 // app.exit() を呼んでライフサイクルを自己管理する自己完結モードであり (tray-probe 等と同じ形)、
 // close-to-tray やトレイ生成は不要 (むしろ callWindow.close() の実測を close-to-tray の横取りから
 // 独立させたい)。
-const isTestRunnerMode = isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness || isM3CloseSpike;
+const isTestRunnerMode =
+  isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness || isM3CloseSpike || isM3WindowProbe;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
+
+// M3 step 2 (窓サイズ/位置記憶): app.getPath("userData") は既定でこの OS ユーザーの実プロファイル
+// ディレクトリ (例 Windows の %APPDATA%/SelfMatrix) を指す。callWindow の bounds 永続化
+// (saveCallWindowState()/loadCallWindowState()、createCallWindow() 参照) はこの配下の JSON
+// ファイルへ読み書きするため、無隔離のまま npm test 系のモードを実行すると開発者の実ユーザー
+// プロファイルへ検証専用の残骸を書いてしまう (タスク要件「userData に書いたテスト残渣が無いこと」)。
+// isTestRunnerMode (tray-probe/minisign-probe/update-wiring-probe は callWindow を一切扱わない
+// ため対象外のままでよい) の間だけ userData を evidence/ 配下 (.gitignore 済み、コミットに紛れない)
+// の使い捨てディレクトリへ差し替える。app.setPath() は app.whenReady() より前 (このモジュールの
+// 同期評価時点) に呼ぶ必要があるため、ここ (isTestRunnerMode 定義直後、どの run*() 関数よりも前)
+// で行う。
+if (app && isTestRunnerMode) {
+  app.setPath("userData", path.join(evidenceDir, ".test-userdata"));
+}
 
 // M2 3b electron-updater 配線: shouldEnableAutoUpdater() (update-apply-gate.cjs) の isTestMode
 // 引数に渡す「これはテスト/検証専用の起動か」の判定。isTestRunnerMode に加えて isTrayProbe/
@@ -306,7 +347,9 @@ function e2eOffscreenBrowserWindowOptions() {
   // 実測 (win.isVisible() の遷移) は画面外配置でも変わらず検証できる (E2E/memory-probe と同じ理由)。
   // M3 step 0 スパイク: callWindow を実際に close() する検証であり、画面上に一瞬でも実ウィンドウが
   // 出ることを避けたい (test-run-preferences と同じ運用者方針) ので同じ扱いに加える。
-  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike) return {};
+  // M3 step 1/2 検証 (--m3-window-probe) も同じ理由 (callWindow の popout/resize/close を実際に
+  // 駆動する) で加える。
+  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe) return {};
   return { x: E2E_OFFSCREEN_WINDOW_POSITION.x, y: E2E_OFFSCREEN_WINDOW_POSITION.y };
 }
 
@@ -467,6 +510,13 @@ const state = {
   // M3 step 0 スパイク (--m3-close-spike) 専用: uncaughtException/unhandledRejection の捕捉先
   // (isM3CloseSpike の process.on() 登録箇所参照)。他モードでは常に空のまま。
   m3SpikeAsyncErrors: [],
+  // M3 step 1/2 検証 (--m3-window-probe) 専用: 同上、isM3WindowProbe の process.on() 登録箇所参照。
+  m3WindowProbeAsyncErrors: [],
+  // M3 step 1 (契約拡張): claimWidgetTransport() が返す onCallViewPlacement() 購読の main 側実体。
+  // detachCallView()/attachCallView()/closeCallView() が計算した computeCallViewAttachedTo() を
+  // ここへ積む診断ログ (evidence/probe 用。実際の push 配信は state.mainWindow.webContents.send()
+  // が担う — pushCallViewPlacement() 参照)。
+  callViewPlacementPushLog: [],
 };
 
 // M2 bounds sync: state.callViewBoundsApplyLog の保持上限 (evidence/メモリの肥大化防止。
@@ -483,7 +533,9 @@ if (app) {
     // app.exit() を明示的に呼んでライフサイクルを自己管理する。M3 step 0 スパイクも同じ理由で加える
     // (runM3CloseSpikeProbe() が callWindow.close() を実際に呼ぶため、mainWindow が生き残っていても
     // 万一 window-all-closed が発火した場合に evidence 書き出し前で終了させないための保険)。
-    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe && !isM3CloseSpike) app.quit();
+    // runM3WindowProbe() (--m3-window-probe) も同じ理由 (popoutCallView()/close=復帰の実駆動) で除外。
+    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe)
+      app.quit();
   });
 }
 
@@ -900,6 +952,73 @@ function createMainWindow() {
   return win;
 }
 
+// M3 step 2 (design/m3-window-ux.md §4「窓サイズ/位置の永続化」、依存追加なし): callWindow の
+// bounds ({x,y,width,height}) を app.getPath("userData") 配下の JSON ファイルへ保存/復元する。
+// isTestRunnerMode では userData 自体が evidence/.test-userdata へ隔離済み (isTestRunnerMode
+// 定義直後の app.setPath() 呼び出し参照) なので、この関数自体はテスト/本番を区別しない。
+const CALL_WINDOW_STATE_FILENAME = "call-window-state.json";
+// resize/move イベントは連続発火する (ドラッグ中は毎フレーム) ため、そのたびに同期 fs 書き込みを
+// 行うと無駄が大きい。最後のイベントから既定時間だけ静止したら 1 回だけ書き込む単純なデバウンス。
+const CALL_WINDOW_STATE_SAVE_DEBOUNCE_MS = 400;
+
+function callWindowStateFilePath() {
+  return path.join(app.getPath("userData"), CALL_WINDOW_STATE_FILENAME);
+}
+
+// 保存されていない/壊れている/不正な値であれば null を返す (呼び出し元はその場合に既定値へ
+// フォールバックする) — 永続化ファイルは信頼された自分自身の過去の書き込みだが、手動編集や
+// 他バージョンとの互換性崩れに対しても main プロセスを落とさない、という他の入力検証
+// (validateCallViewBounds() 等) と同じ fail-safe 方針を踏襲する。
+function loadCallWindowState() {
+  try {
+    const raw = fs.readFileSync(callWindowStateFilePath(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed)) return null;
+    const { x, y, width, height } = parsed;
+    const isFiniteNumber = (n) => typeof n === "number" && Number.isFinite(n);
+    if (!isFiniteNumber(x) || !isFiniteNumber(y) || !isFiniteNumber(width) || !isFiniteNumber(height)) return null;
+    if (width <= 0 || height <= 0) return null;
+    return { x, y, width, height };
+  } catch (error) {
+    return null;
+  }
+}
+
+let callWindowStateSaveTimer = null;
+function saveCallWindowState(bounds) {
+  if (callWindowStateSaveTimer) clearTimeout(callWindowStateSaveTimer);
+  callWindowStateSaveTimer = setTimeout(() => {
+    callWindowStateSaveTimer = null;
+    try {
+      fs.mkdirSync(app.getPath("userData"), { recursive: true });
+      fs.writeFileSync(callWindowStateFilePath(), `${JSON.stringify(bounds, null, 2)}\n`, "utf8");
+    } catch (error) {
+      // ベストエフォート -- 永続化の失敗 (書き込み権限等) で通話/ウィンドウ操作自体を止めない。
+      state.widgetMessages.push({
+        t: Date.now(),
+        type: "call-window-state-save-error",
+        error: String(error && error.message ? error.message : error),
+      });
+    }
+  }, CALL_WINDOW_STATE_SAVE_DEBOUNCE_MS);
+}
+
+// M3 step 1 (design §3-5「placement 状態の逆方向 push」): call view の attach 先
+// ("main" | "window" | "none"、computeCallViewAttachedTo() が実contentView階層から逆算する値) を
+// mainWindow (shell-preload.cjs 経由で cinny) へ push する。detachCallView()/attachCallView()/
+// closeCallView() のいずれもユーザー操作 (⧉ ボタン等) 経由とは限らない — 別窓をユーザーが X ボタンで
+// 閉じたときの close=復帰 (createCallWindow() の "close" ハンドラ→attachCallView()) は cinny 側が
+// 何も呼んでいないのに main 側で勝手に attach が起きる経路であり、cinny UI (⧉ ボタンの状態・
+// 「別窓表示中」表示) を実状態に追従させるにはこの push が必須 (onCallControlState とは別チャンネル、
+// nativeBridge.ts の onCallViewPlacement() 契約コメント参照)。
+function pushCallViewPlacement() {
+  const placement = computeCallViewAttachedTo();
+  state.callViewPlacementPushLog.push({ t: Date.now(), placement });
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+    state.mainWindow.webContents.send("native:call-view-placement", placement);
+  }
+}
+
 // M3 step 0 スパイク (design/m3-window-ux.md §3-1): 別窓を**ユーザーが実際に閉じた**ときの挙動。
 // `options.closeMode` で 2 方式を切り替えられる (runM3CloseSpikeProbe() が両方を実測して比較する
 // ためだけの引数 -- 本番の唯一の呼び出し元 detachCallView() は常に省略、既定の "close-preserve" を
@@ -923,13 +1042,24 @@ function createMainWindow() {
 //     がこの経路の例外を握ってプロセスを道連れにしないようにする。
 function createCallWindow(options = {}) {
   const closeMode = options.closeMode === "closed-legacy" ? "closed-legacy" : "close-preserve";
+  // M3 step 2 (窓サイズ/位置記憶): 前回保存された bounds があれば既定の 960x640/中央配置の代わりに
+  // それを初期値として使う。savedBounds の x/y は e2eOffscreenBrowserWindowOptions() の spread が
+  // このオブジェクトリテラルで後勝ちする (下記 ...e2eOffscreenBrowserWindowOptions() の位置に注意) ため、
+  // テスト/E2E モードでは savedBounds.x/y があっても画面外配置が必ず優先される — savedBounds.width/
+  // height だけは e2eOffscreenBrowserWindowOptions() が触れないフィールドなのでそのまま活きる
+  // (「窓サイズ読み戻し」検証はこのプロパティで成立する)。
+  const savedBounds = loadCallWindowState();
   const win = new BrowserWindow({
     title: "SelfMatrix Call",
     width: 960,
     height: 640,
+    ...(savedBounds
+      ? { x: savedBounds.x, y: savedBounds.y, width: savedBounds.width, height: savedBounds.height }
+      : {}),
     show: !isSmoke,
     // E2E (--e2e-real-join) 専用: mainWindow と同じ理由で画面外座標に開く (detach/popout 検証
-    // (windowMoveReparenting) 中もこの別窓が画面内に現れないようにするため)。
+    // (windowMoveReparenting) 中もこの別窓が画面内に現れないようにするため)。savedBounds よりも
+    // 後ろに置くことで x/y を確実に上書きする (上のコメント参照)。
     ...e2eOffscreenBrowserWindowOptions(),
     webPreferences: {
       nodeIntegration: false,
@@ -939,7 +1069,15 @@ function createCallWindow(options = {}) {
       backgroundThrottling: false,
     },
   });
-  win.on("resize", updateCallViewBounds);
+  win.on("resize", () => {
+    updateCallViewBounds();
+    if (!win.isDestroyed()) saveCallWindowState(win.getBounds());
+  });
+  // M3 step 2: 位置変更は call view の bounds (全面追従、updateCallViewBounds() 参照) には影響しない
+  // ので updateCallViewBounds() は呼ばない — 永続化だけを行う。
+  win.on("move", () => {
+    if (!win.isDestroyed()) saveCallWindowState(win.getBounds());
+  });
   if (closeMode === "closed-legacy") {
     win.on("closed", () => {
       state.callWindow = null;
@@ -1430,6 +1568,10 @@ async function closeCallView() {
   // false を返すだけの no-op)。isCallActive() は state.callViewState を見るため、この代入の直後で
   // なければならない (通話中判定が正しく "非アクティブ" に切り替わった後で呼ぶ必要がある)。
   maybeApplyPendingUpdate();
+  // M3 step 1 (placement push): 通話終了 (hangup) も "none" への placement 変化。computeCallViewAttachedTo()
+  // は state.callView が null の時点で必ず "none" を返す (関数コメント参照) ので、直上の代入より後で
+  // 呼べば正しい値が push される。
+  pushCallViewPlacement();
 }
 
 function updateCallViewBounds() {
@@ -1440,11 +1582,26 @@ function updateCallViewBounds() {
   // だけが「実際に call view を表示すべき領域」を知っている。この関数の下のハーネス固定式
   // (x=max(380,width*0.52) 等) は desktop-shell.html (ハーネス、既定/--smoke/--memory-probe) 向けの
   // 近似値に過ぎず、cinny-shell モードでこれを使うと実際の cinny レイアウト (サイドバー幅・チャット
-  // 開閉等) とズレる。cinny-shell モードでは何もしない — 実適用は
+  // 開閉等) とズレる。cinny-shell モードの attached 中は何もしない — 実適用は
   // applyCallViewBoundsFromCinny() ("native:set-call-view-bounds" ハンドラ) 経由の cinny からの
-  // push だけが担う (win.on("resize", updateCallViewBounds) からの呼び出しも含め、この関数の
-  // 他の呼び出し元はすべて素通りする)。ハーネスモード (--smoke 等) は影響を受けず従来どおり。
-  if (isCinnyShell) return;
+  // push だけが担う (win.on("resize", ...) からの呼び出しも含め、この関数の他の呼び出し元は
+  // すべて素通りする)。ハーネスモード (--smoke 等) は影響を受けず従来どおり。
+  //
+  // M3 step 2 (design §3-4「bounds と detached の相互作用」): ただし detached (別窓 popout) 中は
+  // cinny 側に push 経路そのものが無い (nativeBridge.ts の setCallViewBounds() 契約コメント
+  // 「detached 中はこのメソッドを呼ぶ状況が現状発生しない」参照) — callWindow 自身の resize から
+  // call view を全面 (`{x:0,y:0,width,height}`) に追従させる経路を、cinny-shell モードに限って
+  // ここに復活させる。attached 中の cinny push 経路とは完全に分離 (このブロックは detached の
+  // ときにしか動かない) しているため、上の「attached 中は cinny の push だけが担う」という不変条件は
+  // 変えていない。
+  if (isCinnyShell) {
+    if (state.callViewState !== "detached") return;
+    const detachedOwner = state.callWindow;
+    if (!detachedOwner || detachedOwner.isDestroyed()) return;
+    const [detachedWidth, detachedHeight] = detachedOwner.getContentSize();
+    state.callView.setBounds({ x: 0, y: 0, width: detachedWidth, height: detachedHeight });
+    return;
+  }
 
   const owner = state.callViewState === "detached" ? state.callWindow : state.mainWindow;
   if (!owner || owner.isDestroyed()) return;
@@ -1564,6 +1721,10 @@ async function detachCallView(options = {}) {
     state.callWindow.contentView.addChildView(state.callView);
     state.callViewState = "detached";
     updateCallViewBounds();
+    // M3 step 1 (placement push): popoutCallView() (claim-once transport) 経由でも、E2E/harness の
+    // 直接呼び出し経由でも、この関数を通る限り必ず push する — 呼び出し元を区別しない (design §3-5
+    // のとおり cinny 側は「実際にどこへ動いたか」だけを知る必要がある)。
+    pushCallViewPlacement();
   }
 }
 
@@ -1574,6 +1735,10 @@ async function attachCallView() {
     state.mainWindow.contentView.addChildView(state.callView);
     state.callViewState = "attached";
     updateCallViewBounds();
+    // M3 step 1 (placement push): createCallWindow() の close=復帰ハンドラもこの関数を呼ぶだけなので、
+    // ユーザーが別窓を X ボタンで閉じた場合の「勝手な attach」もここから自動的に push される
+    // (design §3-5 の核心 — cinny 側は明示的に何も呼んでいないのに main 側で状態が変わるケース)。
+    pushCallViewPlacement();
   }
 }
 
@@ -1812,6 +1977,17 @@ function setupIpc() {
     openCallView(url, localStorageSnapshot),
   );
   ipcMain.handle("native:close-call-view", () => closeCallView());
+
+  // M3 step 1 (design/m3-window-ux.md §2 サブステップ 1): claimWidgetTransport() が返す
+  // popoutCallView()/popinCallView() (nativeBridge.ts 契約) の main 側実体。上の
+  // native:detach-call-view/native:attach-call-view (harness トポロジ限定、window.selfmatrixNative
+  // 直下の常時公開 API) とは別物 — こちらは claim-once オブジェクト内のメソッドの実体であり、
+  // トポロジを問わず (isCinnyShell の内外どちらでも) 常に登録する。呼ぶ関数自体
+  // (detachCallView()/attachCallView()) は完全に同一 — 「本番の唯一の呼び出し元 detachCallView() は
+  // 常に closeMode を省略する」という createCallWindow() のコメントどおり、ここでも options なしで
+  // 呼ぶ (= 常に close-preserve)。
+  ipcMain.handle("native:popout-call-view", () => detachCallView());
+  ipcMain.handle("native:popin-call-view", () => attachCallView());
 
   // M1 step 3c-2 (localStorage 契約の実機対応、README「cinny の nativeBridge.ts 契約への適合」
   // 節参照): call-control-preload.cjs が dom-ready より前 (preload 実行時) に同期的に読み出す
@@ -3607,6 +3783,333 @@ async function runM3CloseSpikeProbe() {
   app.exit(result.pass ? 0 : 1);
 }
 
+// M3 step 1/2 検証 (--m3-window-probe, design/m3-window-ux.md §2 サブステップ 1/2): 契約拡張
+// (popoutCallView()/popinCallView()/onCallViewPlacement()) と close=復帰 production 化 + 窓
+// サイズ/位置記憶を、production の呼び出し経路で駆動して検証する。runM3CloseSpikeProbe() との違い:
+// あちらは main プロセスのモジュールスコープ関数 (detachCallView() 等) を直接呼ぶが、こちらは常に
+// mainWindow (本番 topology、cinny 実バンドルがトップフレーム) の中で
+// `window.selfmatrixNative.claimWidgetTransport()` を実際に claim し、そこから返る transport の
+// `popoutCallView()`/`popinCallView()`/`onCallViewPlacement()` を呼ぶ — cinny-shell-smoke
+// (runCinnyShellSmoke()) が transport.sendToView() 等を叩くのと同じやり方で、「契約 → IPC →
+// detachCallView()/attachCallView()」という production の全経路を通す。
+//
+// pass/fail は各ステップの結果を素朴に記録するだけでなく (「記録だけ」を禁じるタスク要件)、
+// steps.*.pass を AND した m3WindowProbeStepsPass() で判定する。どれか 1 ステップでも失敗すれば
+// 以降のステップは実行せず即座に FAIL 終了する (m3-close-spike の「detach-step-failed 等で早期
+// return する」構造と同じ)。
+function m3WindowProbeStepsPass(steps) {
+  const values = Object.values(steps);
+  return values.length > 0 && values.every((step) => step && step.pass === true);
+}
+
+async function finishM3WindowProbe(steps, failReason) {
+  const pass = failReason ? false : m3WindowProbeStepsPass(steps);
+  const result = {
+    pass,
+    failReason: failReason || null,
+    steps,
+    // pushCallViewPlacement() が積む診断ログ (main 側の視点。cinny 側視点の履歴は各 steps.*.placementsSoFar
+    // に別途記録済み — こちらは「main が実際に何回・何を push したか」の独立した証跡)。
+    placementPushLog: state.callViewPlacementPushLog,
+    asyncErrors: state.m3WindowProbeAsyncErrors,
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "m3-window-probe-result.json"),
+    `${JSON.stringify(deepSanitizeEvidence(result), null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[m3-window-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
+
+  try {
+    await closeCallView();
+  } catch (error) {
+    // ベストエフォート -- 後始末の失敗自体は pass/fail に影響させない (runM3CloseSpikeRound() の
+    // finally ブロックと同じ方針)。
+  }
+  state.sourcePickerWindow?.destroy();
+  if (state.callWindow && !state.callWindow.isDestroyed()) state.callWindow.destroy();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
+  state.server?.close();
+  app.exit(result.pass ? 0 : 1);
+}
+
+async function runM3WindowProbe() {
+  const win = state.mainWindow;
+  const steps = {};
+
+  try {
+    // 0. cinny (本番 topology) のロード完了を待ってから、claim-once transport を 1 回だけ claim し、
+    //    onCallViewPlacement() を購読する。runCinnyShellSmoke() の item 1/2 と同じやり方。
+    await win.webContents.executeJavaScript(
+      `(document.readyState === "complete" ? Promise.resolve() : new Promise((resolve) => {
+        window.addEventListener("load", () => resolve(), { once: true });
+      }))`,
+      true,
+    );
+    const claimResult = await win.webContents.executeJavaScript(
+      `(() => {
+        try {
+          window.__selfmatrixM3WindowProbe = {
+            transport: window.selfmatrixNative.claimWidgetTransport(),
+            placements: [],
+          };
+          window.__selfmatrixM3WindowProbe.unsubscribe =
+            window.__selfmatrixM3WindowProbe.transport.onCallViewPlacement((placement) => {
+              window.__selfmatrixM3WindowProbe.placements.push({ t: Date.now(), placement });
+            });
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, error: String(error && error.message ? error.message : error) };
+        }
+      })()`,
+      true,
+    );
+    steps.claim = { ...claimResult, pass: claimResult.ok === true };
+    if (!steps.claim.pass) return await finishM3WindowProbe(steps, "claim-step-failed");
+
+    // 1. call view (RTC 自己ループバック、m3-close-spike-test.html) を確立する。契約検証の対象は
+    //    popout/popin/placement/close-revert/bounds であり、call view の作り方自体は
+    //    m3-close-spike と揃えて最小化する (production では openCallView() が同じ役割を担う)。
+    createCallViewIfNeeded();
+    const testUrl = `${state.origin}/m3-close-spike-test.html`;
+    await state.callView.webContents.loadURL(testUrl);
+    const webContentsIdInitial = state.callView.webContents.id;
+    await state.callView.webContents.executeJavaScript(E2E_RTC_WRAPPER_SCRIPT, true);
+    const startResult = await state.callView.webContents.executeJavaScript("window.__m3StartSpike()", true);
+    const initialConnect = await waitForM3SpikeConnected(state.callView, 15000);
+    steps.initialConnect = {
+      startResult,
+      ...initialConnect,
+      pass: initialConnect.ok === true && initialConnect.connected === true,
+    };
+    if (!steps.initialConnect.pass) return await finishM3WindowProbe(steps, "initial-connect-failed");
+    const loadMarkerInitial = initialConnect.loadMarker;
+
+    // 2. popoutCallView() (契約 → IPC → detachCallView()、既定 = close-preserve): 無再接続で別窓へ。
+    const popoutResult = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popoutCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const afterPopout = await readM3SpikeState(state.callView);
+    const attachedToAfterPopout = computeCallViewAttachedTo();
+    const placementsAfterPopout = await win.webContents.executeJavaScript(
+      "window.__selfmatrixM3WindowProbe.placements.map((p) => p.placement)",
+      true,
+    );
+    steps.popout = {
+      popoutResult,
+      attachedTo: attachedToAfterPopout,
+      webContentsId: state.callView.webContents.id,
+      connected: Boolean(afterPopout.ok && afterPopout.connected),
+      loadMarker: afterPopout.loadMarker,
+      placementsSoFar: placementsAfterPopout,
+      pass:
+        popoutResult.ok === true &&
+        attachedToAfterPopout === "window" &&
+        state.callView.webContents.id === webContentsIdInitial &&
+        Boolean(afterPopout.ok && afterPopout.connected) &&
+        afterPopout.loadMarker === loadMarkerInitial &&
+        Array.isArray(placementsAfterPopout) &&
+        placementsAfterPopout.includes("window"),
+    };
+    if (!steps.popout.pass) return await finishM3WindowProbe(steps, "popout-step-failed");
+
+    // 3. 窓サイズ/位置記憶: OS のマウスドラッグは自動化できないため (tray-probe 等と同じ方針)、
+    //    win.setBounds() を直接呼んで「実ユーザーがリサイズ/移動した」のと同じ実イベント
+    //    (resize/move) を発火させる。x は E2E_OFFSCREEN_WINDOW_POSITION (-4000) と同じ「画面外」
+    //    帯に収め、テスト実行中に実ウィンドウが画面内へ動かないようにする (test-run-preferences の
+    //    運用者方針)。デフォルト (960x640 / 中央配置) や E2E オフスクリーン既定値 (-4000,100) の
+    //    どちらとも異なる値にして、後続の read-back 検証が偶然の一致でないことを担保する。
+    const customBounds = { x: -3800, y: 133, width: 811, height: 622 };
+    const callWindowBeforeClose = state.callWindow;
+    callWindowBeforeClose.setBounds(customBounds);
+    // Windows の DPI/フレーム丸め (実測: setBounds({width:811,...}) が getBounds() で 812 として
+    // 読み戻る等) により、要求した customBounds と OS が実際に適用した値は 1px 単位でズレ得る。
+    // 「要求値どおりに保存/復元されたか」ではなく「OS が実際に適用した値どおりに保存/復元されたか」
+    // を検証対象にする — setBounds() 直後 (デバウンス待ちより前) に実値を読み直して基準にする。
+    const actualWindowBoundsAfterSet = callWindowBeforeClose.getBounds();
+    const [actualContentWidthAfterSet, actualContentHeightAfterSet] = callWindowBeforeClose.getContentSize();
+    // saveCallWindowState() のデバウンス (CALL_WINDOW_STATE_SAVE_DEBOUNCE_MS) より確実に長く待つ。
+    await wait(CALL_WINDOW_STATE_SAVE_DEBOUNCE_MS + 400);
+    const callViewBoundsAfterResize = state.callView.getBounds();
+    let persistedRaw = null;
+    try {
+      persistedRaw = JSON.parse(fs.readFileSync(callWindowStateFilePath(), "utf8"));
+    } catch (error) {
+      persistedRaw = null;
+    }
+    const loadedBackViaFunction = loadCallWindowState();
+    steps.boundsPersistenceWrite = {
+      customBounds,
+      actualWindowBoundsAfterSet,
+      callViewBoundsAfterResize,
+      persistedRaw,
+      loadedBackViaFunction,
+      pass:
+        callViewBoundsAfterResize.x === 0 &&
+        callViewBoundsAfterResize.y === 0 &&
+        callViewBoundsAfterResize.width === actualContentWidthAfterSet &&
+        callViewBoundsAfterResize.height === actualContentHeightAfterSet &&
+        Boolean(persistedRaw) &&
+        persistedRaw.x === actualWindowBoundsAfterSet.x &&
+        persistedRaw.y === actualWindowBoundsAfterSet.y &&
+        persistedRaw.width === actualWindowBoundsAfterSet.width &&
+        persistedRaw.height === actualWindowBoundsAfterSet.height &&
+        Boolean(loadedBackViaFunction) &&
+        loadedBackViaFunction.width === actualWindowBoundsAfterSet.width &&
+        loadedBackViaFunction.height === actualWindowBoundsAfterSet.height,
+    };
+    if (!steps.boundsPersistenceWrite.pass) return await finishM3WindowProbe(steps, "bounds-persistence-write-failed");
+
+    // 4. popinCallView() (契約 → IPC → attachCallView()): 無再接続往復の後半 + placement push "main"。
+    const popinResult = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popinCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const afterPopin = await readM3SpikeState(state.callView);
+    const attachedToAfterPopin = computeCallViewAttachedTo();
+    const placementsAfterPopin = await win.webContents.executeJavaScript(
+      "window.__selfmatrixM3WindowProbe.placements.map((p) => p.placement)",
+      true,
+    );
+    steps.popin = {
+      popinResult,
+      attachedTo: attachedToAfterPopin,
+      webContentsId: state.callView.webContents.id,
+      connected: Boolean(afterPopin.ok && afterPopin.connected),
+      loadMarker: afterPopin.loadMarker,
+      placementsSoFar: placementsAfterPopin,
+      pass:
+        popinResult.ok === true &&
+        attachedToAfterPopin === "main" &&
+        state.callView.webContents.id === webContentsIdInitial &&
+        Boolean(afterPopin.ok && afterPopin.connected) &&
+        afterPopin.loadMarker === loadMarkerInitial &&
+        Array.isArray(placementsAfterPopin) &&
+        placementsAfterPopin.length >= 2 &&
+        placementsAfterPopin[placementsAfterPopin.length - 1] === "main",
+    };
+    if (!steps.popin.pass) return await finishM3WindowProbe(steps, "popin-step-failed");
+
+    // 5. close=復帰 (production): 契約経由で再度 popout し、今度は「ユーザーが別窓の X ボタンを押す」
+    //    のと同じ経路 (win.close() -- win.destroy() ではない) を直接発火させる。cinny 側は
+    //    popinCallView() を一度も呼んでいないのに main 側で勝手に "main" へ復帰する経路そのものを
+    //    検証する (design §3-1/§3-2 の状態機械保護、design §3-5 の逆方向 push の両方がここで揃う)。
+    const popoutAgain = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popoutCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const attachedToAfterSecondPopout = computeCallViewAttachedTo();
+    const callWindowForClose = state.callWindow;
+    const callWindowIdBeforeClose = callWindowForClose ? callWindowForClose.id : null;
+    callWindowForClose.close();
+    const windowDestroyed = await waitForM3SpikeCondition(
+      () => !callWindowForClose || callWindowForClose.isDestroyed(),
+      8000,
+    );
+    await wait(300);
+    const afterCloseRevert = await readM3SpikeState(state.callView);
+    const attachedToAfterCloseRevert = computeCallViewAttachedTo();
+    const placementsAfterCloseRevert = await win.webContents.executeJavaScript(
+      "window.__selfmatrixM3WindowProbe.placements.map((p) => p.placement)",
+      true,
+    );
+    steps.closeRevert = {
+      popoutAgain,
+      attachedToAfterSecondPopout,
+      windowDestroyed,
+      callWindowIdBeforeClose,
+      attachedToAfterCloseRevert,
+      webContentsId: state.callView ? state.callView.webContents.id : null,
+      webContentsDestroyed: state.callView ? state.callView.webContents.isDestroyed() : true,
+      connected: Boolean(afterCloseRevert.ok && afterCloseRevert.connected),
+      loadMarker: afterCloseRevert.loadMarker,
+      callViewState: state.callViewState,
+      placementsSoFar: placementsAfterCloseRevert,
+      pass:
+        popoutAgain.ok === true &&
+        attachedToAfterSecondPopout === "window" &&
+        windowDestroyed === true &&
+        Boolean(state.callView) &&
+        !state.callView.webContents.isDestroyed() &&
+        state.callView.webContents.id === webContentsIdInitial &&
+        attachedToAfterCloseRevert === "main" &&
+        Boolean(afterCloseRevert.ok && afterCloseRevert.connected) &&
+        afterCloseRevert.loadMarker === loadMarkerInitial &&
+        state.callViewState !== "none" &&
+        Array.isArray(placementsAfterCloseRevert) &&
+        placementsAfterCloseRevert[placementsAfterCloseRevert.length - 1] === "main",
+    };
+    if (!steps.closeRevert.pass) return await finishM3WindowProbe(steps, "close-revert-step-failed");
+
+    // 6. 窓サイズ read-back: close=復帰で state.callWindow は null に戻っている
+    //    (createCallWindow() の close ハンドラ参照)。再度 popoutCallView() すれば createCallWindow()
+    //    が新しい BrowserWindow を作り直す — そのときに step 3 で永続化した bounds
+    //    (actualWindowBoundsAfterSet — OS 適用後の実値、customBounds そのものではない点は step 3
+    //    コメント参照) が実際に初期 bounds として復元されることを、新しいウィンドウの実
+    //    win.getBounds() から確認する (x/y は e2eOffscreenBrowserWindowOptions() が常にオフスクリーン
+    //    座標で上書きする -- テストが実ウィンドウを画面内に出さないための意図的な仕様、
+    //    createCallWindow() のコメント参照 -- のでここでは width/height のみを比較する。x/y の
+    //    永続化そのものは step 3 で persistedRaw/loadedBackViaFunction により既に確認済み)。
+    const popoutThirdTime = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popoutCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const newCallWindow = state.callWindow;
+    const newCallWindowBounds = newCallWindow && !newCallWindow.isDestroyed() ? newCallWindow.getBounds() : null;
+    // Windows の DPI/フレーム丸めは既存ウィンドウへの setBounds() (step 3) だけでなく、新規
+    // BrowserWindow 生成時の初期 bounds 適用でも独立に ±1px 程度発生し得る (実測: 623 で保存した
+    // 高さが新規生成後に 624 として読める、等)。JSON ファイルへの保存値そのものはバイト単位で正確
+    // であること (persistedRaw/loadedBackViaFunction, step 3) を既に確認済みなので、ここでは「新規
+    // ウィンドウが前回保存サイズの近傍で復元されたか」を小さな許容誤差 (OS 丸めの範囲を十分に
+    // カバーしつつ、明らかな未適用 (例: 既定の 960x640 のまま) は確実に弾ける値) で判定する。
+    const BOUNDS_READBACK_TOLERANCE_PX = 4;
+    const widthDelta = newCallWindowBounds ? Math.abs(newCallWindowBounds.width - actualWindowBoundsAfterSet.width) : Infinity;
+    const heightDelta = newCallWindowBounds
+      ? Math.abs(newCallWindowBounds.height - actualWindowBoundsAfterSet.height)
+      : Infinity;
+    steps.boundsReadBack = {
+      popoutThirdTime,
+      newCallWindowId: newCallWindow ? newCallWindow.id : null,
+      isNewWindowInstance: Boolean(newCallWindow) && newCallWindow.id !== callWindowIdBeforeClose,
+      newCallWindowBounds,
+      widthDelta,
+      heightDelta,
+      pass:
+        popoutThirdTime.ok === true &&
+        Boolean(newCallWindow) &&
+        newCallWindow.id !== callWindowIdBeforeClose &&
+        Boolean(newCallWindowBounds) &&
+        widthDelta <= BOUNDS_READBACK_TOLERANCE_PX &&
+        heightDelta <= BOUNDS_READBACK_TOLERANCE_PX,
+    };
+
+    return await finishM3WindowProbe(steps, null);
+  } catch (error) {
+    steps.uncaught = { error: String(error && error.message ? error.message : error), pass: false };
+    return await finishM3WindowProbe(steps, "uncaught-error");
+  }
+}
+
 // M2 minisign 署名検証: --minisign-probe の本体。plain node 版 probe (minisign-verify-probe.cjs)
 // と意図して独立にテストベクタを組み立てる (検証ロジックのバグをテストコード側のバグで隠す
 // リスクを避けるため、他の probe との使い回しはしない)。ここで確かめたいことは 3 つだけ:
@@ -3772,6 +4275,7 @@ async function main() {
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
   if (isTrayProbe) await runTrayProbe();
   if (isM3CloseSpike) await runM3CloseSpikeProbe();
+  if (isM3WindowProbe) await runM3WindowProbe();
 }
 
 function evidenceFileForMode() {
@@ -3779,6 +4283,7 @@ function evidenceFileForMode() {
   if (isMemoryProbe) return "memory-result.json";
   if (isTrayProbe) return "tray-probe-result.json";
   if (isM3CloseSpike) return "m3-close-spike-result.json";
+  if (isM3WindowProbe) return "m3-window-probe-result.json";
   return "smoke-result.json";
 }
 

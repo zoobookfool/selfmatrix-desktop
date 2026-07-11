@@ -52,6 +52,25 @@ ipcRenderer.on("native:call-control:state", (_event, payload) => {
   }
 });
 
+// M3 step 1 (design/m3-window-ux.md §2 サブステップ 1、§3-5): main.cjs の pushCallViewPlacement()
+// (detachCallView()/attachCallView()/closeCallView() のいずれかが呼ばれるたびに送られる、
+// "native:call-view-placement") を onCallViewPlacement() で登録されたリスナー全員へ配る。
+// callControlStateListeners と全く同じパターン (モジュールスコープで ipcRenderer.on を 1 度だけ
+// 登録し、実際の配信先集合だけを claim 済みトランスポートの onCallViewPlacement() 経由で
+// 登録/解除する) — call view 側 DOM の MutationObserver 起点の state push とは異なり、こちらは
+// main プロセス自身の WebContentsView 再親子付け状態が起点だが、shell-preload.cjs 側の中継の形は
+// 対称にしてある。
+const callViewPlacementListeners = new Set();
+ipcRenderer.on("native:call-view-placement", (_event, placement) => {
+  for (const listener of callViewPlacementListeners) {
+    try {
+      listener(placement);
+    } catch (error) {
+      console.error("[shell-preload] onCallViewPlacement listener threw: ", error);
+    }
+  }
+});
+
 // F2b (受け入れレビュー修正): この prototype は cinny を同一オリジンの iframe として埋め込んでいる
 // (desktop-shell.html の #cinny-frame)。同一オリジンなので、cinny の iframe コンテンツ内の JS は
 // ブラウザ標準の同一オリジンアクセスとして `window.parent.selfmatrixNative` に触れられる —
@@ -134,6 +153,29 @@ function claimWidgetTransport() {
       callControlStateListeners.add(listener);
       return () => {
         callControlStateListeners.delete(listener);
+      };
+    },
+    // M3 step 1 (design §2 サブステップ 1): 通話 View を別窓へ無再接続で出す。main 側の実体は
+    // detachCallView() (native:popout-call-view ハンドラ、main.cjs の setupIpc() 参照) — 呼び出す
+    // たびに新しい WebContentsView を作り直すことはなく、既存の call view を再親子付けするだけ
+    // (無再接続、M3 step 0 スパイクで実証済みの close-preserve 方式と同じ WebContentsView 実体)。
+    popoutCallView: () => ipcRenderer.invoke("native:popout-call-view"),
+    // M3 step 1: 通話 View をメインへ戻す。main 側の実体は attachCallView()
+    // (native:popin-call-view ハンドラ)。既に "main" にあれば no-op (attachCallView() 自身の
+    // callViewState ガード)。
+    popinCallView: () => ipcRenderer.invoke("native:popin-call-view"),
+    // M3 step 1 (design §3-5): call view の attach 先 ("main"/"window"/"none") が変化するたびに
+    // main プロセス (pushCallViewPlacement()、detachCallView()/attachCallView()/closeCallView() の
+    // いずれからも呼ばれる) から push される "native:call-view-placement" を購読する。
+    // onCallControlState() と全く同じパターン (このファイル冒頭の callViewPlacementListeners に
+    // 登録、戻り値は unsubscribe 関数)。別窓をユーザーが閉じたときの close=復帰のように、cinny 側が
+    // popoutCallView()/popinCallView() を呼んでいないのに main 側で状態が変わる経路があるため、この
+    // 購読が cinny UI (⧉ ボタン等) の実状態同期に必須 (nativeBridge.ts の onCallViewPlacement()
+    // 契約コメント参照)。
+    onCallViewPlacement: (listener) => {
+      callViewPlacementListeners.add(listener);
+      return () => {
+        callViewPlacementListeners.delete(listener);
       };
     },
     // M2 (Fable 全体レビュー arch-major 解消、bounds 同期): cinny の NativeCallEmbed.setPlacement()
