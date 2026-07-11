@@ -215,6 +215,40 @@ const isMinisignProbe = process.argv.includes("--minisign-probe");
 // (下部の `if (app) {...}` 分岐、runUpdateWiringProbe() 参照)。
 const isUpdateWiringProbe = process.argv.includes("--update-wiring-probe");
 
+// M3 step 0 スパイク: 別窓 (callWindow) をユーザーが実際に閉じたとき、子 WebContentsView
+// (= 生きた RTCPeerConnection) が無再接続でメインへ復帰できるかを実証する専用モード
+// (design/m3-window-ux.md §3-1 の最大未検証リスク)。Docker/実バックエンドは不要 --
+// 自己ループバックの RTCPeerConnection (src/m3-close-spike-test.html) を call view に
+// loadURL() して「生きた通話中の WebContentsView」を再現し、その状態で実際に
+// callWindow.close() (win.destroy() ではなく、実ユーザーの X ボタンと同じ 'close'→'closed' の
+// イベント列を通す) を呼ぶ。runM3CloseSpikeProbe() 参照。
+const isM3CloseSpike = process.argv.includes("--m3-close-spike");
+// runM3CloseSpikeProbe() の対照実験 (旧 "closed" ハンドラ、現行 createCallWindow() の初期実装) は
+// 意図的に無防備な attachCallView() 呼び出しを再現する (下記 createCallWindow() 参照)。子
+// WebContentsView が本当に巻き込み破棄された場合、そこへの addChildView() 等が例外を投げる可能性が
+// あり、素の呼び出し元 (win.on("closed", ...) は .catch を持たない fire-and-forget) では
+// unhandledRejection になり得る。既定では Node はこれを警告出力するだけで平常続行するが、念のため
+// このモードに限り明示的に捕捉して証跡へ積み、プロセスを絶対に道連れにしない (他モードの挙動は
+// 一切変えない — isM3CloseSpike のときだけ登録)。
+if (isM3CloseSpike) {
+  process.on("uncaughtException", (error) => {
+    state.m3SpikeAsyncErrors.push({
+      t: Date.now(),
+      type: "uncaughtException",
+      // G6 と同じ方針 (preload-error 参照): stack ではなく message のみを保持する
+      // (絶対パスを含み得るスタックトレースを証跡に残さないため)。
+      error: String(error && error.message ? error.message : error),
+    });
+  });
+  process.on("unhandledRejection", (reason) => {
+    state.m3SpikeAsyncErrors.push({
+      t: Date.now(),
+      type: "unhandledRejection",
+      error: String(reason && reason.message ? reason.message : reason),
+    });
+  });
+}
+
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
 // smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
@@ -225,7 +259,11 @@ const isUpdateWiringProbe = process.argv.includes("--update-wiring-probe");
 // 期待している契約を壊してしまう。--harness も同じ理由で検証専用モードとして対象外にする。
 // --tray-probe はこの一覧に入れず、`isTrayProbe ||` で明示的に有効化する — 「本番相当でトレイ生成
 // + close-to-tray を有効化」した状態を検証するのがこのモードの目的そのものであるため。
-const isTestRunnerMode = isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness;
+// M3 step 0 スパイク (--m3-close-spike) もここに加える: runM3CloseSpikeProbe() は自分の末尾で
+// app.exit() を呼んでライフサイクルを自己管理する自己完結モードであり (tray-probe 等と同じ形)、
+// close-to-tray やトレイ生成は不要 (むしろ callWindow.close() の実測を close-to-tray の横取りから
+// 独立させたい)。
+const isTestRunnerMode = isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness || isM3CloseSpike;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
 
 // M2 3b electron-updater 配線: shouldEnableAutoUpdater() (update-apply-gate.cjs) の isTestMode
@@ -266,7 +304,9 @@ const E2E_OFFSCREEN_WINDOW_POSITION = Object.freeze({ x: -4000, y: 100 });
 function e2eOffscreenBrowserWindowOptions() {
   // M2 トレイ常駐: tray-probe も「テストは画面に出ないで欲しい」の対象に加える。close-to-tray の
   // 実測 (win.isVisible() の遷移) は画面外配置でも変わらず検証できる (E2E/memory-probe と同じ理由)。
-  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe) return {};
+  // M3 step 0 スパイク: callWindow を実際に close() する検証であり、画面上に一瞬でも実ウィンドウが
+  // 出ることを避けたい (test-run-preferences と同じ運用者方針) ので同じ扱いに加える。
+  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike) return {};
   return { x: E2E_OFFSCREEN_WINDOW_POSITION.x, y: E2E_OFFSCREEN_WINDOW_POSITION.y };
 }
 
@@ -424,6 +464,9 @@ const state = {
   // M2 3b electron-updater 配線: maybeCheckForUpdates() が実際に有効化条件を満たしたかどうかの
   // 診断用スナップショット (--update-wiring-probe / evidence 用)。
   autoUpdaterEnabled: false,
+  // M3 step 0 スパイク (--m3-close-spike) 専用: uncaughtException/unhandledRejection の捕捉先
+  // (isM3CloseSpike の process.on() 登録箇所参照)。他モードでは常に空のまま。
+  m3SpikeAsyncErrors: [],
 };
 
 // M2 bounds sync: state.callViewBoundsApplyLog の保持上限 (evidence/メモリの肥大化防止。
@@ -437,8 +480,10 @@ if (app) {
     // は本当にウィンドウを破棄してしまう)。ここで app.quit() してしまうと、evidence を書き出す前に
     // プロセスごと終了してしまい、変異を「検知して FAIL を記録する」ことができなくなる —
     // 他の run*() 系モードと同じく、tray-probe も自分の run 関数 (runTrayProbe()) の末尾で
-    // app.exit() を明示的に呼んでライフサイクルを自己管理する。
-    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe) app.quit();
+    // app.exit() を明示的に呼んでライフサイクルを自己管理する。M3 step 0 スパイクも同じ理由で加える
+    // (runM3CloseSpikeProbe() が callWindow.close() を実際に呼ぶため、mainWindow が生き残っていても
+    // 万一 window-all-closed が発火した場合に evidence 書き出し前で終了させないための保険)。
+    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe && !isM3CloseSpike) app.quit();
   });
 }
 
@@ -612,6 +657,13 @@ function startServer() {
     if (url.pathname === "/health.json") {
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ ok: true, cinnyDist, ecDist }));
+      return;
+    }
+    if (url.pathname === "/m3-close-spike-test.html") {
+      // M3 step 0 スパイク (--m3-close-spike) 専用: 実バックエンド不要の自己ループバック
+      // RTCPeerConnection テストページ (desktop-shell.html と同じ静的配信パターン)。
+      // runM3CloseSpikeProbe() 以外のモードではこのパスへ到達すること自体が無い。
+      serveFile(response, path.join(__dirname, "m3-close-spike-test.html"));
       return;
     }
 
@@ -848,7 +900,29 @@ function createMainWindow() {
   return win;
 }
 
-function createCallWindow() {
+// M3 step 0 スパイク (design/m3-window-ux.md §3-1): 別窓を**ユーザーが実際に閉じた**ときの挙動。
+// `options.closeMode` で 2 方式を切り替えられる (runM3CloseSpikeProbe() が両方を実測して比較する
+// ためだけの引数 -- 本番の唯一の呼び出し元 detachCallView() は常に省略、既定の "close-preserve" を
+// 使う)。
+//
+//   - "close-preserve" (既定、design §3-1 の推奨方式、M3 step 0 スパイクで実証済み): 破棄前・
+//     キャンセル可能な "close" イベントで event.preventDefault() → attachCallView() で子
+//     WebContentsView をメインへ退避 → 退避完了後に win.destroy() で実際に破棄する。
+//     mainWindow の close-to-tray (createMainWindow() の "close" ハンドラ) と同型のパターン。
+//     callViewState が "detached" のとき (= このウィンドウが実際に call view を持っているとき) に
+//     限って横取りする -- 退出ボタン押下 (closeCallView()) が窓 close とほぼ同時のレースでは、
+//     closeCallView() が先に callViewState を "none" に落としていれば何もせず通常どおり破棄させる
+//     (design §3-1 論点 2)。
+//   - "closed-legacy" (対照専用、旧実装をそのまま再現): 破棄後・キャンセル不可の "closed" で
+//     attachCallView() を試みるだけ。M3 step 0 スパイク以前の実装そのもの -- Electron が子
+//     WebContentsView を親ウィンドウの破棄に巻き込む場合、ここに到達した時点で既に破棄されており
+//     無再接続復帰が成立しない、という仮説を実測するための対照。意図的に無防備 (attachCallView() の
+//     失敗を捕捉しない) なままにしてある -- 捕捉してしまうと「現行コードがそのまま踏む経路」を
+//     忠実に再現できなくなる。isM3CloseSpike 実行時のみ登録されるプロセスレベルの
+//     uncaughtException/unhandledRejection ハンドラ (このファイル冒頭、isM3CloseSpike 定義直後)
+//     がこの経路の例外を握ってプロセスを道連れにしないようにする。
+function createCallWindow(options = {}) {
+  const closeMode = options.closeMode === "closed-legacy" ? "closed-legacy" : "close-preserve";
   const win = new BrowserWindow({
     title: "SelfMatrix Call",
     width: 960,
@@ -866,10 +940,34 @@ function createCallWindow() {
     },
   });
   win.on("resize", updateCallViewBounds);
-  win.on("closed", () => {
-    state.callWindow = null;
-    if (state.callView) attachCallView();
-  });
+  if (closeMode === "closed-legacy") {
+    win.on("closed", () => {
+      state.callWindow = null;
+      if (state.callView) attachCallView();
+    });
+  } else {
+    win.on("close", (event) => {
+      if (state.callViewState !== "detached" || !state.callView) return;
+      event.preventDefault();
+      attachCallView()
+        .catch((error) => {
+          state.widgetMessages.push({
+            t: Date.now(),
+            type: "call-window-close-attach-error",
+            error: String(error && error.message ? error.message : error),
+          });
+        })
+        .finally(() => {
+          state.callWindow = null;
+          if (!win.isDestroyed()) win.destroy();
+        });
+    });
+    win.on("closed", () => {
+      // 保険 (上の "close" ハンドラが preventDefault() し損ねた場合や、OS/アプリ終了経由で直接
+      // 破棄された場合でも state.callWindow を必ず追従させる)。
+      state.callWindow = null;
+    });
+  }
   state.callWindow = win;
   return win;
 }
@@ -1454,9 +1552,13 @@ function applyCallViewBoundsFromCinny(rawBounds) {
   pushCallViewBoundsLog(entry);
 }
 
-async function detachCallView() {
+// M3 step 0 スパイク: `options.closeMode` は callWindow をまだ持っていない場合のみ
+// createCallWindow() へそのまま素通しする (runM3CloseSpikeProbe() が対照実験用に
+// "closed-legacy" を渡すためだけの引数。本番の呼び出し元は常に省略する -- createCallWindow() の
+// closeMode コメント参照)。
+async function detachCallView(options = {}) {
   createCallViewIfNeeded();
-  if (!state.callWindow) createCallWindow();
+  if (!state.callWindow) createCallWindow(options);
   if (state.callViewState !== "detached") {
     state.mainWindow.contentView.removeChildView(state.callView);
     state.callWindow.contentView.addChildView(state.callView);
@@ -3246,6 +3348,265 @@ async function runTrayProbe() {
   app.exit(result.pass ? 0 : 1);
 }
 
+// M3 step 0 スパイク (--m3-close-spike, design/m3-window-ux.md §3-1): 別窓をユーザーが実際に閉じた
+// とき、子 WebContentsView (= 生きた RTCPeerConnection) が無再接続でメインへ復帰できるかを、
+// Docker/実バックエンド無しで実証する。call view に自己ループバック RTCPeerConnection テストページ
+// (src/m3-close-spike-test.html) を loadURL し、その状態で実際に callWindow.close() (win.destroy()
+// ではなく、実ユーザーの X ボタンと同じ 'close'→'closed' のイベント列を通す) を呼ぶ。
+
+// call view 内で評価する再利用スクリプト。native-callflow.e2e.mjs の PCS_SUMMARY_SCRIPT と同じ形
+// (window.__selfmatrixPcs は main.cjs 冒頭の E2E_RTC_WRAPPER_SCRIPT が作る計装データ)。
+const M3_SPIKE_STATE_SCRIPT = `(() => {
+  const pcs = (window.__selfmatrixPcs || []).map((r) => ({
+    id: r.id,
+    connectionState: r.connectionState,
+    iceConnectionState: r.iceConnectionState,
+    reachedConnected: r.reachedConnected,
+  }));
+  const spike = window.__m3SpikeState || {};
+  return {
+    pcs,
+    dataChannelsOpen: typeof spike.dataChannelsOpen === "function" ? spike.dataChannelsOpen() : false,
+    ready: spike.ready === true,
+    error: spike.error || null,
+    loadMarker: spike.loadMarker || null,
+  };
+})()`;
+
+function m3SpikePcLive(pc) {
+  return (
+    pc.connectionState === "connected" || pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed"
+  );
+}
+
+// call view の現在の window.__m3SpikeState/window.__selfmatrixPcs を読む。view が無い/破棄済みなら
+// ok:false を返すだけで例外にはしない (呼び出し側のポーリングループを単純にするため、他の
+// __selfmatrixE2E ヘルパーと同じ方針)。
+async function readM3SpikeState(view) {
+  if (!view || view.webContents.isDestroyed()) {
+    return { ok: false, connected: false, reason: "no-view-or-destroyed" };
+  }
+  try {
+    const value = await view.webContents.executeJavaScript(M3_SPIKE_STATE_SCRIPT, true);
+    const pcs = value.pcs || [];
+    const allLive = pcs.length >= 2 && pcs.every(m3SpikePcLive);
+    return {
+      ok: true,
+      connected: allLive && value.dataChannelsOpen === true,
+      pcs,
+      dataChannelsOpen: value.dataChannelsOpen,
+      loadMarker: value.loadMarker,
+      error: value.error,
+    };
+  } catch (error) {
+    return { ok: false, connected: false, reason: String(error && error.message ? error.message : error) };
+  }
+}
+
+async function waitForM3SpikeConnected(view, timeoutMs) {
+  const started = Date.now();
+  let last = { ok: false, connected: false, reason: "timeout" };
+  while (Date.now() - started < timeoutMs) {
+    // eslint-disable-next-line no-await-in-loop
+    last = await readM3SpikeState(view);
+    if (last.ok && last.connected) return last;
+    // eslint-disable-next-line no-await-in-loop
+    await wait(150);
+  }
+  return last;
+}
+
+async function waitForM3SpikeCondition(predicate, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (predicate()) return true;
+    // eslint-disable-next-line no-await-in-loop
+    await wait(100);
+  }
+  return predicate();
+}
+
+// 1 ラウンド分 (シナリオ a〜d 全ステップ) を実行する。closeMode==="close-preserve" (採用方式) では
+// 無再接続復帰の成立 (survived===true) を、closeMode==="closed-legacy" (対照、現行実装の再現) では
+// 不成立 (survived===false) を期待する -- 期待どおりだったかどうかが round.pass。
+async function runM3CloseSpikeRound(closeMode) {
+  const round = { closeMode, expectSurvive: closeMode === "close-preserve" };
+  try {
+    // (a) callView 作成 → 自己ループバック接続確立。webContents.id と (did-start-navigation 由来の)
+    // ナビゲーション回数を基準値として記録する。
+    createCallViewIfNeeded();
+    const testUrl = `${state.origin}/m3-close-spike-test.html`;
+    await state.callView.webContents.loadURL(testUrl);
+    const webContentsIdInitial = state.callView.webContents.id;
+    const navCountAtLoad = state.navigationEvents.length;
+
+    // E2E_RTC_WRAPPER_SCRIPT (M1 step 3c-1 計装) を先に注入してから window.__m3StartSpike() を呼ぶ --
+    // window.RTCPeerConnection を計装で包み終えた後に pc1/pc2 を生成させることで、dom-ready
+    // タイミングに依存せず両方が確実に window.__selfmatrixPcs に記録されるようにしてある
+    // (m3-close-spike-test.html 冒頭コメント参照)。
+    await state.callView.webContents.executeJavaScript(E2E_RTC_WRAPPER_SCRIPT, true);
+    round.startResult = await state.callView.webContents.executeJavaScript("window.__m3StartSpike()", true);
+
+    const initialConnect = await waitForM3SpikeConnected(state.callView, 15000);
+    round.initialConnect = initialConnect;
+    round.webContentsIdInitial = webContentsIdInitial;
+    if (!initialConnect.ok || !initialConnect.connected) {
+      round.pass = false;
+      round.reason = "initial-connect-failed";
+      return round;
+    }
+    const loadMarkerInitial = initialConnect.loadMarker;
+
+    // (b) detachCallView(): メイン → callWindow へ再親子付け (対照実験のときだけ closeMode を
+    // "closed-legacy" として素通しする -- detachCallView()/createCallWindow() コメント参照)。
+    await detachCallView({ closeMode });
+    await wait(400);
+    const stateAfterDetach = await readM3SpikeState(state.callView);
+    const afterDetach = {
+      attachedTo: computeCallViewAttachedTo(),
+      webContentsId: state.callView.webContents.id,
+      webContentsDestroyed: state.callView.webContents.isDestroyed(),
+      navCount: state.navigationEvents.length,
+      connected: Boolean(stateAfterDetach.ok && stateAfterDetach.connected),
+      loadMarker: stateAfterDetach.loadMarker,
+    };
+    round.afterDetach = afterDetach;
+    const detachOk =
+      afterDetach.attachedTo === "window" &&
+      afterDetach.webContentsId === webContentsIdInitial &&
+      !afterDetach.webContentsDestroyed &&
+      afterDetach.navCount === navCountAtLoad &&
+      afterDetach.connected &&
+      afterDetach.loadMarker === loadMarkerInitial;
+    round.detachOk = detachOk;
+    if (!detachOk) {
+      round.pass = false;
+      round.reason = "detach-step-failed";
+      return round;
+    }
+
+    // (c) 実際にユーザーが X ボタンを押すのと同じ経路で callWindow を close する
+    // (win.destroy() ではなく win.close() -- createCallWindow() の closeMode 分岐参照)。
+    const callWindowRef = state.callWindow;
+    const callWindowIdBeforeClose = callWindowRef ? callWindowRef.id : null;
+    callWindowRef.close();
+    const windowDestroyed = await waitForM3SpikeCondition(() => !callWindowRef || callWindowRef.isDestroyed(), 8000);
+    // close-preserve は preventDefault() 後に attachCallView() の完了を待ってから win.destroy() する
+    // ため、破棄自体は少し遅れて起きる -- 破棄検知後さらに一呼吸置いて後続の非同期処理
+    // (updateCallViewBounds 等) が収まるのを待つ。
+    await wait(300);
+
+    // (d) close 後の判定。
+    const callViewStillReferenced = Boolean(state.callView);
+    const webContentsDestroyedAfterClose = callViewStillReferenced ? state.callView.webContents.isDestroyed() : true;
+    const attachedToAfterClose = computeCallViewAttachedTo();
+    const stateAfterClose =
+      callViewStillReferenced && !webContentsDestroyedAfterClose
+        ? await readM3SpikeState(state.callView)
+        : { ok: false, connected: false, reason: "destroyed-or-missing" };
+    const afterClose = {
+      windowDestroyed,
+      callWindowIdBeforeClose,
+      callViewStillReferenced,
+      webContentsDestroyedAfterClose,
+      webContentsId: callViewStillReferenced && !webContentsDestroyedAfterClose ? state.callView.webContents.id : null,
+      attachedTo: attachedToAfterClose,
+      navCount: state.navigationEvents.length,
+      connected: Boolean(stateAfterClose.ok && stateAfterClose.connected),
+      loadMarker: stateAfterClose.loadMarker ?? null,
+      callViewState: state.callViewState,
+      asyncErrorsSoFar: state.m3SpikeAsyncErrors.length,
+    };
+    round.afterClose = afterClose;
+
+    const survived =
+      windowDestroyed &&
+      callViewStillReferenced &&
+      !webContentsDestroyedAfterClose &&
+      attachedToAfterClose === "main" &&
+      afterClose.webContentsId === webContentsIdInitial &&
+      afterClose.navCount === navCountAtLoad &&
+      afterClose.connected &&
+      afterClose.loadMarker === loadMarkerInitial &&
+      state.callViewState !== "none";
+
+    round.survived = survived;
+    round.pass = survived === round.expectSurvive;
+    return round;
+  } catch (error) {
+    round.pass = false;
+    round.error = String(error && error.message ? error.message : error);
+    return round;
+  } finally {
+    // 次ラウンドをクリーンな状態から始める。closeCallView() は callView/callWindow の現在の状態
+    // (destroyed 済みの WebContentsView・null な callWindow 等) に関わらず安全に後始末できる設計
+    // (closeCallView() 自身のコメント参照)。
+    try {
+      await closeCallView();
+    } catch (error) {
+      state.widgetMessages.push({
+        t: Date.now(),
+        type: "m3-close-spike-round-cleanup-error",
+        error: String(error && error.message ? error.message : error),
+      });
+    }
+    if (state.callWindow && !state.callWindow.isDestroyed()) {
+      try {
+        state.callWindow.destroy();
+      } catch (error) {
+        // ベストエフォート -- 後始末の失敗自体は round の pass/fail には影響させない。
+      }
+    }
+    state.callWindow = null;
+  }
+}
+
+async function runM3CloseSpikeProbe() {
+  // 対照 (旧 "closed" 方式) を先に実測してから採用方式 (新 "close" 方式) を実測する。対照側で
+  // Electron が子 view を巻き込み破棄する場合でも、後始末 (closeCallView()/callWindow.destroy()) は
+  // state ベースの防御的コードなので、採用方式のラウンドは独立してクリーンな状態から始まる。
+  const legacyRound = await runM3CloseSpikeRound("closed-legacy");
+  const preserveRound = await runM3CloseSpikeRound("close-preserve");
+
+  // 採用方式 (close-preserve) が実際に無再接続復帰を成立させたことが GO の必須条件。対照
+  // (closed-legacy) は「期待どおり失敗した (survived===false)」ことを比較データとして記録するだけで
+  // pass/fail のゲートにはしない -- 採用方式さえ動いていれば GO の判断は揺るがない (対照側だけ生き
+  // 残り採用側が失敗するケースは、採用方式が対照の退避を包含する上位互換である以上あり得ない)。
+  const pass = preserveRound.pass === true && preserveRound.survived === true;
+
+  const result = {
+    pass,
+    adoptedCloseMode: "close-preserve",
+    rounds: { legacy: legacyRound, preserve: preserveRound },
+    comparison: {
+      legacySurvived: legacyRound.survived ?? null,
+      preserveSurvived: preserveRound.survived ?? null,
+      legacyMatchedNoGoHypothesis: legacyRound.survived === false,
+      preserveMatchedGoHypothesis: preserveRound.survived === true,
+    },
+    asyncErrors: state.m3SpikeAsyncErrors,
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "m3-close-spike-result.json"),
+    `${JSON.stringify(deepSanitizeEvidence(result), null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[m3-close-spike] FAIL:", JSON.stringify(result, null, 2));
+  }
+
+  state.sourcePickerWindow?.destroy();
+  state.callWindow?.destroy();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
+  state.server?.close();
+  app.exit(result.pass ? 0 : 1);
+}
+
 // M2 minisign 署名検証: --minisign-probe の本体。plain node 版 probe (minisign-verify-probe.cjs)
 // と意図して独立にテストベクタを組み立てる (検証ロジックのバグをテストコード側のバグで隠す
 // リスクを避けるため、他の probe との使い回しはしない)。ここで確かめたいことは 3 つだけ:
@@ -3410,12 +3771,14 @@ async function main() {
   if (isMemoryProbe) await runMemoryProbe();
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
   if (isTrayProbe) await runTrayProbe();
+  if (isM3CloseSpike) await runM3CloseSpikeProbe();
 }
 
 function evidenceFileForMode() {
   if (isCinnyShellSmoke) return "cinny-shell-result.json";
   if (isMemoryProbe) return "memory-result.json";
   if (isTrayProbe) return "tray-probe-result.json";
+  if (isM3CloseSpike) return "m3-close-spike-result.json";
   return "smoke-result.json";
 }
 

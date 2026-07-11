@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>selfmatrix m3-close-spike</title>
+  </head>
+  <body style="margin: 0; padding: 0; font-family: sans-serif">
+    <!--
+      SelfMatrix M3 step 0 スパイク専用テストページ (Docker/バックエンド不要):
+
+      main.cjs の runM3CloseSpikeProbe() が call view (WebContentsView) にこのページを直接
+      loadURL() する。目的はただ 1 つ — 「生きた RTCPeerConnection (+ DataChannel) を持つ
+      WebContentsView」を、実バックエンド (Matrix/LiveKit) 無しで再現すること。
+
+      この <script> は読み込み時に何もしない (自動接続しない)。接続の開始は main プロセス側が
+      E2E_RTC_WRAPPER_SCRIPT (main.cjs、RTCPeerConnection 計装ラッパ) を先に注入し終えてから
+      window.__m3StartSpike() を明示的に呼び出す (executeJavaScript 経由) ことで行う。これにより
+      「ページの自動実行 (dom-ready 前後のタイミング) とラッパ注入の競合」を完全に排除している —
+      window.RTCPeerConnection を計装で包み終えた後に initiate するので、ここで作る pc1/pc2 は
+      必ず window.__selfmatrixPcs (main.cjs 参照) に記録される。
+
+      自己ループバック手法: 同一ページ内で 2 つの RTCPeerConnection (pc1/pc2) を直接 offer/answer
+      交換し、trickle ICE で候補を相互に渡す。STUN/TURN もシグナリングサーバも不要 — 同一マシン内の
+      host candidate 同士で直接 P2P 接続できる (実バックエンド不要というタスク要件の核心)。
+    -->
+    <script>
+      window.__m3SpikeState = {
+        started: false,
+        ready: false,
+        error: null,
+        // 「このページが (意図せず) 再読み込みされていないか」を main プロセス側の
+        // did-start-navigation 計測 (state.navigationEvents) とは独立に、ページ内からも確認できる
+        // ようにするための一意マーカー。再読み込みされれば必ず値が変わる。
+        loadMarker: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      };
+
+      window.__m3StartSpike = async function () {
+        // 冪等化 (二重呼び出し対策。想定シナリオでは 1 度しか呼ばれない)。
+        if (window.__m3SpikeState.started) return { ok: true, alreadyStarted: true };
+        window.__m3SpikeState.started = true;
+        try {
+          const pc1 = new RTCPeerConnection({ iceServers: [] });
+          const pc2 = new RTCPeerConnection({ iceServers: [] });
+
+          pc1.addEventListener("icecandidate", (event) => {
+            if (event.candidate) pc2.addIceCandidate(event.candidate).catch(() => {});
+          });
+          pc2.addEventListener("icecandidate", (event) => {
+            if (event.candidate) pc1.addIceCandidate(event.candidate).catch(() => {});
+          });
+
+          let dc1Open = false;
+          let dc2Open = false;
+          const dc1 = pc1.createDataChannel("m3-close-spike");
+          dc1.addEventListener("open", () => {
+            dc1Open = true;
+          });
+          pc2.addEventListener("datachannel", (event) => {
+            event.channel.addEventListener("open", () => {
+              dc2Open = true;
+            });
+          });
+
+          const offer = await pc1.createOffer();
+          await pc1.setLocalDescription(offer);
+          await pc2.setRemoteDescription(offer);
+          const answer = await pc2.createAnswer();
+          await pc2.setLocalDescription(answer);
+          await pc1.setRemoteDescription(answer);
+
+          window.__m3SpikeState.dataChannelsOpen = () => dc1Open && dc2Open;
+          window.__m3SpikeState.ready = true;
+          return { ok: true };
+        } catch (error) {
+          window.__m3SpikeState.error = String(error && error.message ? error.message : error);
+          return { ok: false, error: window.__m3SpikeState.error };
+        }
+      };
+    </script>
+  </body>
+</html>
