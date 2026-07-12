@@ -1,9 +1,6 @@
-// electron-updater (NsisUpdater) の `verifyUpdateCodeSignature` フックの雛形。
-// design/release-pipeline.md §4 のフロー: 自動更新が installer を適用する前に、installer の隣に
-// 置かれた `.minisig` を埋め込み公開鍵で検証し、失敗したら適用を中止する。
-//
-// **electron-updater 本体はまだこのリポジトリに入れていない** (3b で別途配線する — このファイルは
-// 検証ロジックの雛形のみで、`autoUpdater.verifyUpdateCodeSignature = ...` の実配線はしない)。
+// MinisignNsisUpdater が取得した installer と隣接 `.minisig` を埋め込み公開鍵で検証する。
+// 失敗理由の文字列/null という契約は electron-updater の署名検証と同じだが、stock NsisUpdater の
+// publisherName 早期 return を通さず、SelfMatrix 専用 updater から必ず直接呼ばれる。
 //
 // フックの型契約 (electron-updater / electron-builder の NsisUpdater が期待する形):
 //   (publisherName: string[] | undefined, installerPath: string) => Promise<string | null>
@@ -63,7 +60,7 @@ function readInstallerAndSignature(installerPath) {
 // 検証する — 本物の RELEASE_PUBLIC_KEY に対応する秘密鍵は誰も持っていないので、既定のまま では
 // 正当な署名を用意しての "成功系" テストができないため)。実運用での配線 (3b) は、引数無しで
 // 呼んで得られる `verifyUpdateCodeSignature` (下でエクスポートしている、RELEASE_PUBLIC_KEY を
-// 使う既定インスタンス) を `autoUpdater.verifyUpdateCodeSignature` に代入する想定。
+// 使う既定インスタンス) を MinisignNsisUpdater が呼ぶ。
 function createVerifyUpdateCodeSignature(publicKeyText = RELEASE_PUBLIC_KEY) {
   return async function verifyUpdateCodeSignature(_publisherName, installerPath) {
     const read = readInstallerAndSignature(installerPath);
@@ -79,11 +76,6 @@ function createVerifyUpdateCodeSignature(publicKeyText = RELEASE_PUBLIC_KEY) {
   };
 }
 
-// 3b (別タスク) で electron-updater 本体を導入したら:
-//   const { autoUpdater } = require("electron-updater");
-//   autoUpdater.verifyUpdateCodeSignature = verifyUpdateCodeSignature;
-//   autoUpdater.allowDowngrade = false; // design/release-pipeline.md §4
-// のように配線する。ここではロジックの雛形とテスト (probe) のみを提供する。
 const verifyUpdateCodeSignature = createVerifyUpdateCodeSignature();
 
 module.exports = {

@@ -74,8 +74,8 @@ nsis:
   artifactName: "${productName}-Setup-${version}.${ext}"
 
 # CI (design/release-pipeline.md §6) がドラフトリリースへ成果物をアップロードする先。署名は
-# CI に入れない (秘密鍵は運用者の手元のみ、§5) -- publish はここでは経路の宣言のみで、実際の
-# `electron-builder --publish` 呼び出しは本タスクのスコープ外 (CI 実装は別タスク)。
+# CI に入れず、electron-builder 自身の publish も `--publish never` で止める。workflow が成果物を
+# draft releaseへ添付し、運用者が `.minisig` を追加してから手動公開する。
 publish:
   provider: github
   owner: zoobookfool

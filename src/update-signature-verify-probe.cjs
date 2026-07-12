@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// M2 minisign 署名検証: update-signature-verify.cjs (electron-updater の verifyUpdateCodeSignature
-// フック雛形) の単体検証 probe。plain node 上で完結する (fs/crypto のみ、Electron 非依存)。
+// M2 minisign 署名検証: MinisignNsisUpdater が呼ぶ update-signature-verify.cjs の単体検証 probe。
+// plain node 上で完結する (fs/crypto のみ、Electron 非依存)。
 //
 // RELEASE_PUBLIC_KEY (モジュール内の既定定数 = 運用者の実公開鍵) に対応する秘密鍵は運用者の手元に
 // しか無いため、この probe から "正当な署名 -> null" を確かめることはできない (probe は運用者の
@@ -163,7 +163,7 @@ function finish() {
 
   const evidence = {
     pass,
-    task: "M2 update-signature-verify.cjs: verifyUpdateCodeSignature hook stub end-to-end probe",
+    task: "M2 update-signature-verify.cjs: minisign file verification end-to-end probe",
     note:
       "Uses createVerifyUpdateCodeSignature(publicKeyText) with an in-process, never-persisted " +
       "Ed25519 test key so the exact production code path (verifyMinisign + file I/O) is exercised " +

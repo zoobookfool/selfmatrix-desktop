@@ -17,6 +17,7 @@ const {
   Tray,
   Menu,
   nativeImage,
+  screen,
 } = electron;
 const fs = require("node:fs");
 const http = require("node:http");
@@ -67,8 +68,10 @@ const { blake2b512, NATIVE_BLAKE2B512_AVAILABLE } = require("./minisign-blake2b.
 // verifyUpdateCodeSignature (minisign 検証フック本体、既に §3a で実装済みだったが electron-updater
 // 未配線だったもの) と、その配線条件 (有効化/適用) を判定する Electron 非依存の純関数群。
 // 二重実装を避ける方針は他の *.cjs 純関数モジュールと同じ (widget-bridge-protocol.cjs 等参照)。
-const { verifyUpdateCodeSignature } = require("./update-signature-verify.cjs");
+const { MinisignNsisUpdater } = require("./minisign-nsis-updater.cjs");
+const { runUpdateDownloadProbe } = require("./update-download-probe.cjs");
 const { shouldEnableAutoUpdater, shouldApplyUpdateNow } = require("./update-apply-gate.cjs");
+const { restoreWindowBounds } = require("./window-bounds.cjs");
 
 // F1 (受け入れレビュー修正): smoke がハンドシェイク完了後に注入する偽メッセージの action 名。
 // widgetId をわざと WIDGET_ID と不一致にしてあるので validateWidgetBridgeMessage の
@@ -232,6 +235,12 @@ const isMinisignProbe = process.argv.includes("--minisign-probe");
 // (下部の `if (app) {...}` 分岐、runUpdateWiringProbe() 参照)。
 const isUpdateWiringProbe = process.argv.includes("--update-wiring-probe");
 
+// 実 NsisUpdater の download task をローカル HTTP provider で駆動し、installer と sidecar
+// `.minisig` の取得、正常署名の受理、署名欠落/改ざんの拒否を確認する。package:probe:update-download
+// は同じモードを dist/win-unpacked/SelfMatrix.exe から起動し、製品同梱後の経路も検証する。
+const isUpdateDownloadProbe = process.argv.includes("--update-download-probe");
+const isSingleInstanceProbe = process.argv.includes("--single-instance-probe");
+
 // M3 step 0 スパイク: 別窓 (callWindow) をユーザーが実際に閉じたとき、子 WebContentsView
 // (= 生きた RTCPeerConnection) が無再接続でメインへ復帰できるかを実証する専用モード
 // (design/m3-window-ux.md §3-1 の最大未検証リスク)。Docker/実バックエンドは不要 --
@@ -336,7 +345,9 @@ const isTestRunnerMode =
   isM3CloseSpike ||
   isM3WindowProbe ||
   isExternalMuteProbe ||
-  isExternalApiProbe;
+  isExternalApiProbe ||
+  isUpdateDownloadProbe ||
+  isSingleInstanceProbe;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
 
 // グローバルホットキーの起動時自動適用 (applyExternalMuteHotkeyFromPersistedState()) は本番相当の
@@ -375,6 +386,13 @@ const hasExplicitUserDataDir = process.argv.some((a) => a.startsWith("--user-dat
 if (app && isTestRunnerMode && !hasExplicitUserDataDir) {
   app.setPath("userData", path.join(evidenceDir, ".test-userdata"));
 }
+
+// The lock is scoped by userData, so E2E instances with distinct --user-data-dir values remain
+// independent. A normal second launch exits before it can create duplicate servers, windows, or tray state.
+const hasSingleInstanceLock = app ? app.requestSingleInstanceLock() : false;
+let focusRequestedBySecondInstance = false;
+let secondInstanceEventCount = 0;
+if (app && !hasSingleInstanceLock) app.exit(0);
 
 // 外部ミュート制御検証 (--external-mute-probe) 専用: 決定的な検証のため、起動のたびに前回実行の
 // 残留設定ファイルを消してから始める。evidence/.test-userdata は npm test の各モード間で使い回される
@@ -651,7 +669,13 @@ const state = {
 // E2E のリサイズ連打でも十分な履歴が残る件数)。
 const CALL_VIEW_BOUNDS_LOG_LIMIT = 200;
 
-if (app) {
+if (app && hasSingleInstanceLock) {
+  app.on("second-instance", () => {
+    secondInstanceEventCount += 1;
+    focusRequestedBySecondInstance = true;
+    if (app.isReady()) handleTrayActivate();
+  });
+
   app.on("window-all-closed", () => {
     // M2 トレイ常駐: tray-probe もここに加える。runTrayProbe() は意図的に mainWindow.close() を
     // 呼んで close-to-tray の挙動を実測する (preventDefault() が外れる変異が入ると、この close()
@@ -1135,6 +1159,19 @@ function loadCallWindowState() {
   } catch (error) {
     return null;
   }
+}
+
+function restorableCallWindowBounds(savedBounds) {
+  if (!savedBounds || isTestRunnerMode) return savedBounds;
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const workAreas = [
+    primaryDisplay.workArea,
+    ...screen
+      .getAllDisplays()
+      .filter((display) => display.id !== primaryDisplay.id)
+      .map((display) => display.workArea),
+  ];
+  return restoreWindowBounds(savedBounds, workAreas);
 }
 
 let callWindowStateSaveTimer = null;
@@ -1737,7 +1774,7 @@ function createCallWindow(options = {}) {
   // テスト/E2E モードでは savedBounds.x/y があっても画面外配置が必ず優先される — savedBounds.width/
   // height だけは e2eOffscreenBrowserWindowOptions() が触れないフィールドなのでそのまま活きる
   // (「窓サイズ読み戻し」検証はこのプロパティで成立する)。
-  const savedBounds = loadCallWindowState();
+  const savedBounds = restorableCallWindowBounds(loadCallWindowState());
   const win = new BrowserWindow({
     title: "SelfMatrix Call",
     width: 960,
@@ -1872,22 +1909,21 @@ function isCallActive() {
   return state.callViewState !== "none";
 }
 
-// electron-updater の autoUpdater シングルトンを実際に構築するのはこの関数を呼んだときだけ
-// (require("electron-updater") 自体は他の Electron 依存 require と同じくモジュール先頭で行っても
-// 副作用は無いが、初期化 (イベントリスナー登録・フック代入) は明示的にこの関数へまとめておく方が
-// --update-wiring-probe から「まだ何も配線されていない状態」と「配線済みの状態」を作り分けやすい)。
-// main() (本番/smoke/tray-probe 等の通常経路) と runUpdateWiringProbe() の両方から呼ばれる。
+// SelfMatrix 専用 NsisUpdater を実際に構築するのはこの関数を呼んだときだけ。main() と
+// runUpdateWiringProbe() の両方から呼ばれるため冪等にし、イベントリスナーも重複登録しない。
 let autoUpdaterInstance = null;
 
 function setupAutoUpdater() {
-  const { autoUpdater } = require("electron-updater");
+  if (autoUpdaterInstance) return autoUpdaterInstance;
+
+  const autoUpdater = new MinisignNsisUpdater();
   // allowDowngrade 無効 (design/release-pipeline.md §4): 古い改造版へのダウングレード誘導を防ぐ。
   autoUpdater.allowDowngrade = false;
-  // Authenticode コード署名をしない方針 (§1/§8) のため、既定の Windows 発行者証明書検証の代わりに
-  // installer 本体への minisign 署名検証をここに差す (§4 のフロー、update-signature-verify.cjs)。
-  // publisherName 引数は verifyUpdateCodeSignature 内部で使わない (関数コメント参照)。
-  autoUpdater.verifyUpdateCodeSignature = verifyUpdateCodeSignature;
-  // ダウンロード + (上の verifyUpdateCodeSignature による) 検証まで完了したら準備完了フラグを立てる
+  // SelfMatrix は full NSIS installer だけを配布する。web installer の package payload まで別経路で
+  // 取得する構成は minisign gate の対象を曖昧にするため、明示的に禁止する。
+  autoUpdater.disableWebInstaller = true;
+  // installer と sidecar `.minisig` のダウンロード + MinisignNsisUpdater 内の検証まで完了したら
+  // 準備完了フラグを立てる
   // だけで、ここでは quitAndInstall() を呼ばない -- 実際に適用してよいかは
   // maybeApplyPendingUpdate() が通話中かどうかを見てから判断する (§7 の核心)。
   autoUpdater.on("update-downloaded", () => {
@@ -5831,6 +5867,7 @@ async function main() {
   setupE2EIntrospection();
   await startServer();
   createMainWindow();
+  if (focusRequestedBySecondInstance) handleTrayActivate();
   // M2 トレイ常駐: trayEnabled (本番起動、または --tray-probe) のときだけ生成する。
   // テスト/E2E モード (isSmoke/isMemoryProbe/isCinnyShellSmoke/isE2ERealJoin/isHarness) では
   // 呼ばれない (trayEnabled の定義参照)。
@@ -5873,9 +5910,8 @@ function evidenceFileForMode() {
 // main() の重いブート経路 (cinny/EC dist 存在確認・HTTP サーバー・ウィンドウ生成) を経由しない。
 //
 // 検証する内容:
-//   1. setupAutoUpdater() が実際の (require("electron-updater") で得られる) autoUpdater
-//      シングルトンへ verifyUpdateCodeSignature (update-signature-verify.cjs と同一の関数参照) と
-//      allowDowngrade=false を代入すること。
+  //   1. setupAutoUpdater() が stock singleton ではなく MinisignNsisUpdater を構築し、
+  //      allowDowngrade=false / disableWebInstaller=true を設定すること。
 //   2. このプロセス自身は dev/unpacked 実行 (app.isPackaged===false) であり、
 //      isUpdaterTestMode も true (--update-wiring-probe 自体が isUpdaterTestMode に含まれる) なので
 //      maybeCheckForUpdates() を呼んでも checkForUpdatesAndNotify() が実際には一切呼ばれない
@@ -5902,10 +5938,12 @@ async function runUpdateWiringProbe() {
   const calledForThisProcess = maybeCheckForUpdates();
 
   const hookWiring = {
-    verifyUpdateCodeSignatureIsOurs: autoUpdater.verifyUpdateCodeSignature === verifyUpdateCodeSignature,
+    minisignNsisUpdater: autoUpdater instanceof MinisignNsisUpdater,
     allowDowngradeFalse: autoUpdater.allowDowngrade === false,
+    webInstallerDisabled: autoUpdater.disableWebInstaller === true,
   };
-  hookWiring.pass = hookWiring.verifyUpdateCodeSignatureIsOurs && hookWiring.allowDowngradeFalse;
+  hookWiring.pass =
+    hookWiring.minisignNsisUpdater && hookWiring.allowDowngradeFalse && hookWiring.webInstallerDisabled;
 
   const noNetworkCallInTestMode = {
     isPackaged: Boolean(app.isPackaged),
@@ -5968,43 +6006,101 @@ async function runUpdateWiringProbe() {
   app.exit(result.pass ? 0 : 1);
 }
 
+async function runUpdateDownloadProbeMode() {
+  await app.whenReady();
+  const result = await runUpdateDownloadProbe();
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "update-download-probe-result.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+    "utf8",
+  );
+  if (!result.pass) {
+    console.error("[update-download-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
+  app.exit(result.pass ? 0 : 1);
+}
+
+async function runSingleInstanceProbeMode() {
+  await app.whenReady();
+  const prefix = "--single-instance-probe-dir=";
+  const directoryArgument = process.argv.find((value) => value.startsWith(prefix));
+  if (!directoryArgument) throw new Error("--single-instance-probe-dir is required");
+  const probeDir = path.resolve(directoryArgument.slice(prefix.length));
+  fs.mkdirSync(probeDir, { recursive: true });
+  fs.writeFileSync(path.join(probeDir, "ready"), "ready\n", "utf8");
+
+  const deadline = Date.now() + 10_000;
+  while (secondInstanceEventCount === 0 && Date.now() < deadline) {
+    await wait(50);
+  }
+  const result = {
+    pass: secondInstanceEventCount === 1 && state.mainWindow === null && state.tray === null,
+    secondInstanceEventCount,
+    mainWindowCreated: state.mainWindow !== null,
+    trayCreated: state.tray !== null,
+  };
+  fs.writeFileSync(path.join(probeDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  app.exit(result.pass ? 0 : 1);
+}
+
 if (app) {
-  // --minisign-probe / --update-wiring-probe は main() の重いブート経路 (cinny/EC dist 存在確認・
-  // HTTP サーバー・ウィンドウ生成) を必要としない (各 run*Probe() 冒頭のコメント参照) ため、main() を
-  // 経由せず独立に起動する。
-  if (isMinisignProbe) {
-    runMinisignProbe().catch((error) => {
-      fs.mkdirSync(evidenceDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(evidenceDir, "minisign-electron-probe-result.json"),
-        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
-        "utf8",
-      );
-      console.error(error);
-      app.exit(1);
-    });
-  } else if (isUpdateWiringProbe) {
-    runUpdateWiringProbe().catch((error) => {
-      fs.mkdirSync(evidenceDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(evidenceDir, "update-wiring-probe-result.json"),
-        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
-        "utf8",
-      );
-      console.error(error);
-      app.exit(1);
-    });
+  if (!hasSingleInstanceLock) {
+    // app.exit(0) was requested immediately after the lock failed. Do not enter any run mode.
   } else {
-    main().catch((error) => {
-      fs.mkdirSync(evidenceDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(evidenceDir, evidenceFileForMode()),
-        `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
-        "utf8",
-      );
-      console.error(error);
-      app.exit(1);
-    });
+    // --minisign-probe / --update-wiring-probe は main() の重いブート経路 (cinny/EC dist 存在確認・
+    // HTTP サーバー・ウィンドウ生成) を必要としない (各 run*Probe() 冒頭のコメント参照) ため、main() を
+    // 経由せず独立に起動する。
+    if (isSingleInstanceProbe) {
+      runSingleInstanceProbeMode().catch((error) => {
+        console.error(error);
+        app.exit(1);
+      });
+    } else if (isMinisignProbe) {
+      runMinisignProbe().catch((error) => {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(evidenceDir, "minisign-electron-probe-result.json"),
+          `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+          "utf8",
+        );
+        console.error(error);
+        app.exit(1);
+      });
+    } else if (isUpdateWiringProbe) {
+      runUpdateWiringProbe().catch((error) => {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(evidenceDir, "update-wiring-probe-result.json"),
+          `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+          "utf8",
+        );
+        console.error(error);
+        app.exit(1);
+      });
+    } else if (isUpdateDownloadProbe) {
+      runUpdateDownloadProbeMode().catch((error) => {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(evidenceDir, "update-download-probe-result.json"),
+          `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+          "utf8",
+        );
+        console.error(error);
+        app.exit(1);
+      });
+    } else {
+      main().catch((error) => {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(evidenceDir, evidenceFileForMode()),
+          `${JSON.stringify({ pass: false, error: String(error && error.stack ? error.stack : error) }, null, 2)}\n`,
+          "utf8",
+        );
+        console.error(error);
+        app.exit(1);
+      });
+    }
   }
 } else if (require.main === module) {
   throw new Error("selfmatrix-desktop requires Electron. Use `electron src/main.cjs`.");

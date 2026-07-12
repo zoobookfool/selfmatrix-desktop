@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "cinny": {
+    "repository": "zoobookfool/selfmatrix-cinny",
+    "commit": "ec64b637438dd79bc96f0c0c4dae95aeee8cdc9f"
+  },
+  "elementCall": {
+    "repository": "zoobookfool/selfmatrix-element-call",
+    "commit": "e31f335f93a16b20fa1767ee8605c3eec2e2e398"
+  }
+}

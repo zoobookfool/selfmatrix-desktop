@@ -1,17 +1,22 @@
-name: Release
+name: Product CI
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
+
+concurrency:
+  group: desktop-product-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  verify:
     runs-on: windows-latest
+    timeout-minutes: 45
     env:
       NODE_VERSION: "24"
       PNPM_VERSION: "10.33.0"
@@ -23,9 +28,9 @@ jobs:
           path: selfmatrix-desktop
           persist-credentials: false
 
-      - name: Validate tag and load immutable product lock
+      - name: Load immutable product lock
         working-directory: selfmatrix-desktop
-        run: node scripts/release-inputs.cjs --tag "$env:GITHUB_REF_NAME" --write-env "$env:GITHUB_ENV"
+        run: node scripts/release-inputs.cjs --write-env "$env:GITHUB_ENV"
 
       - name: Checkout cinny
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -62,7 +67,7 @@ jobs:
         shell: bash
         run: pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
 
-      - name: Install and verify element-call
+      - name: Verify element-call
         working-directory: element-call
         shell: bash
         run: |
@@ -74,7 +79,7 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
-      - name: Install and verify cinny web/native builds
+      - name: Verify cinny web/native builds
         working-directory: cinny
         shell: bash
         run: |
@@ -91,51 +96,10 @@ jobs:
           VITE_SELFMATRIX_CINNY_SHA: ${{ env.CINNY_REF }}
           VITE_SELFMATRIX_ELEMENT_CALL_SHA: ${{ env.ELEMENT_CALL_REF }}
 
-      - name: Install and test desktop
+      - name: Verify desktop and packaged updater
         working-directory: selfmatrix-desktop
         run: |
           npm ci
           npm audit --omit=dev
           npm test
-
-      - name: Build NSIS installer
-        working-directory: selfmatrix-desktop
-        run: npx electron-builder --win nsis --publish never
-
-      - name: Verify updater in packaged application
-        working-directory: selfmatrix-desktop
-        run: node src/run-packaged-update-download-probe.cjs
-
-      - name: Write build manifest
-        working-directory: selfmatrix-desktop
-        run: node scripts/release-inputs.cjs --write-manifest dist/BUILD-MANIFEST.json
-
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
-        with:
-          subject-path: |
-            selfmatrix-desktop/dist/*.exe
-            selfmatrix-desktop/dist/BUILD-MANIFEST.json
-
-      - name: Generate SHA256SUMS
-        working-directory: selfmatrix-desktop/dist
-        shell: bash
-        run: |
-          sha256sum SelfMatrix-Setup-*.exe SelfMatrix-Setup-*.exe.blockmap latest.yml BUILD-MANIFEST.json > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Create draft release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          draft: true
-          fail_on_unmatched_files: true
-          files: |
-            selfmatrix-desktop/dist/SelfMatrix-Setup-*.exe
-            selfmatrix-desktop/dist/SelfMatrix-Setup-*.exe.blockmap
-            selfmatrix-desktop/dist/latest.yml
-            selfmatrix-desktop/dist/BUILD-MANIFEST.json
-            selfmatrix-desktop/dist/SHA256SUMS
-
-# The workflow intentionally stops at a draft. Before publishing, the operator must sign the
-# installer offline and attach `<installer>.minisig`. The application downloads that exact sidecar
-# and refuses missing or invalid signatures; publishing without it would make the update unusable.
+          npm run package:probe:update-download
