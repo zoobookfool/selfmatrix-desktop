@@ -1013,6 +1013,50 @@ function saveCallWindowState(bounds) {
   }, CALL_WINDOW_STATE_SAVE_DEBOUNCE_MS);
 }
 
+// M3 LATER 項目「通話の別窓の最前面ピン留め」(運用者が実装 GO、design/m3-window-ux.md では
+// LATER 扱いだった)。bounds (上記 CALL_WINDOW_STATE_FILENAME) とは別ファイルに分離する —
+// bounds は resize/move のたびに高頻度で発火しデバウンス書き込みするのに対し、この設定は
+// トレイメニューのクリックでしか変わらない稀な離散イベントであり、同じファイルに相乗りさせると
+// resize/move 側の保存のたびにこの値を読み直して merge する処理が要る (さもないとデバウンス
+// タイマーの競合で上書き消失し得る)。ファイルを分けることで両者は互いに影響しない。
+const CALL_WINDOW_ALWAYS_ON_TOP_FILENAME = "call-window-always-on-top.json";
+
+function callWindowAlwaysOnTopStateFilePath() {
+  return path.join(app.getPath("userData"), CALL_WINDOW_ALWAYS_ON_TOP_FILENAME);
+}
+
+// loadCallWindowState() と同じ fail-safe 方針: 保存されていない/壊れている/不正な値であれば
+// 既定値 (false = OFF) へフォールバックする。
+function loadCallWindowAlwaysOnTopEnabled() {
+  try {
+    const raw = fs.readFileSync(callWindowAlwaysOnTopStateFilePath(), "utf8");
+    const parsed = JSON.parse(raw);
+    return isPlainObject(parsed) && parsed.alwaysOnTop === true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// saveCallWindowState() と異なりデバウンスしない -- こちらは resize/move のような連続イベントでは
+// なく、トレイメニューのクリック 1 回につき高々 1 回しか呼ばれないため、デバウンスする理由がない。
+function saveCallWindowAlwaysOnTopEnabled(enabled) {
+  try {
+    fs.mkdirSync(app.getPath("userData"), { recursive: true });
+    fs.writeFileSync(
+      callWindowAlwaysOnTopStateFilePath(),
+      `${JSON.stringify({ alwaysOnTop: enabled }, null, 2)}\n`,
+      "utf8",
+    );
+  } catch (error) {
+    // ベストエフォート -- 永続化の失敗 (書き込み権限等) でトレイのトグル操作自体を止めない。
+    state.widgetMessages.push({
+      t: Date.now(),
+      type: "call-window-always-on-top-save-error",
+      error: String(error && error.message ? error.message : error),
+    });
+  }
+}
+
 // M3 step 1 (design §3-5「placement 状態の逆方向 push」): call view の attach 先
 // ("main" | "window" | "none"、computeCallViewAttachedTo() が実contentView階層から逆算する値) を
 // mainWindow (shell-preload.cjs 経由で cinny) へ push する。detachCallView()/attachCallView()/
@@ -1092,6 +1136,11 @@ function createCallWindow(options = {}) {
       backgroundThrottling: false,
     },
   });
+  // 通話の別窓の最前面ピン留め: 生成のたびに永続化済みの設定を読み直して適用する -- popout→popin→
+  // 再 popout のたびにこの関数は新しい BrowserWindow を作り直す (close ハンドラが
+  // state.callWindow = null にする、下記コメント参照) ので、生成時点で毎回読み直さないと 2 回目
+  // 以降の別窓に設定が引き継がれない。mainWindow には適用しない (この設定は callWindow 専用)。
+  win.setAlwaysOnTop(loadCallWindowAlwaysOnTopEnabled());
   win.on("resize", () => {
     updateCallViewBounds();
     if (!win.isDestroyed()) saveCallWindowState(win.getBounds());
@@ -1304,6 +1353,20 @@ function toggleAutoLaunch() {
 
 const AUTO_LAUNCH_MENU_LABEL = "PC 起動時に自動起動";
 
+// トレイメニュー「通話の別窓を最前面に固定」の click ハンドラ本体。toggleAutoLaunch() と同じ形
+// (現在値は毎回永続化ファイルから実測して反転させる) だが、反映先が OS レジストリではなく
+// callWindow.setAlwaysOnTop() である点が異なる: callWindow が生存していれば即座に反映し、無ければ
+// 設定の保存だけを行う (次に createCallWindow() が生成する際にそちらが読む、同関数のコメント参照)。
+function toggleCallWindowAlwaysOnTop() {
+  const next = !loadCallWindowAlwaysOnTopEnabled();
+  saveCallWindowAlwaysOnTopEnabled(next);
+  if (state.callWindow && !state.callWindow.isDestroyed()) {
+    state.callWindow.setAlwaysOnTop(next);
+  }
+}
+
+const CALL_WINDOW_ALWAYS_ON_TOP_MENU_LABEL = "通話の別窓を最前面に固定";
+
 // トレイの右クリックメニュー定義。「将来ミュート制御等を足せる構造にしておく」という要件どおり、
 // 項目は配列で持つ (増やす場合はこの配列に追記するだけでよい)。状態を持たない純関数として書いて
 // あるので、createTray() が実際にトレイへ設定するのと runTrayProbe() が検証用に取得するのとで
@@ -1314,6 +1377,12 @@ function trayMenuTemplate() {
     { label: "SelfMatrix を開く", click: () => handleTrayActivate() },
     { type: "separator" },
     { label: AUTO_LAUNCH_MENU_LABEL, type: "checkbox", checked: currentAutoLaunchEnabled(), click: () => toggleAutoLaunch() },
+    {
+      label: CALL_WINDOW_ALWAYS_ON_TOP_MENU_LABEL,
+      type: "checkbox",
+      checked: loadCallWindowAlwaysOnTopEnabled(),
+      click: () => toggleCallWindowAlwaysOnTop(),
+    },
     { type: "separator" },
     { label: "終了", click: () => quitFromTray() },
   ];
@@ -4169,6 +4238,121 @@ async function runM3WindowProbe() {
         widthDelta <= BOUNDS_READBACK_TOLERANCE_PX &&
         heightDelta <= BOUNDS_READBACK_TOLERANCE_PX,
     };
+    // 元は最終ステップだったため早期 return が無かったが、以下の追加ステップがこのステップの
+    // 成功 (newCallWindow が生きていること) を前提にするので、他ステップと同じ fail-fast へ揃える。
+    if (!steps.boundsReadBack.pass) return await finishM3WindowProbe(steps, "bounds-read-back-failed");
+
+    // 7. 通話の別窓の最前面ピン留め (M3 LATER 項目、運用者が実装 GO)。まず「既定 OFF」を検証する。
+    //    直前の callWindow (step 6 で作られたもの) の isAlwaysOnTop() をそのまま読むだけでは、
+    //    それが生成された時点の設定しか見えず「今の既定値」の検証にならない。evidence/.test-userdata
+    //    は test-runner モード間で共有される (isTestRunnerMode 定義直後のコメント参照) ため、設定
+    //    ファイル自体をまず消してから、close=復帰 (step 5/6 と同じ close-preserve の win.close()) で
+    //    実際に破棄させ、再度 popoutCallView() で createCallWindow() に新しい BrowserWindow を
+    //    作らせた上で確認する -- 過去の実行の残骸に依存しない決定的な検証にするため。
+    try {
+      fs.unlinkSync(callWindowAlwaysOnTopStateFilePath());
+    } catch (error) {
+      // 無ければ何もしない (初回実行では当然存在しない) -- loadCallWindowState() と同じ fail-safe。
+    }
+    const windowBeforeDefaultCheck = state.callWindow;
+    windowBeforeDefaultCheck.close();
+    const defaultCheckWindowDestroyed = await waitForM3SpikeCondition(
+      () => !windowBeforeDefaultCheck || windowBeforeDefaultCheck.isDestroyed(),
+      8000,
+    );
+    await wait(300);
+    const popoutForDefaultCheck = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popoutCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const alwaysOnTopDefaultWindow = state.callWindow;
+    const alwaysOnTopDefaultValue =
+      Boolean(alwaysOnTopDefaultWindow) && !alwaysOnTopDefaultWindow.isDestroyed()
+        ? alwaysOnTopDefaultWindow.isAlwaysOnTop()
+        : null;
+    steps.alwaysOnTopDefault = {
+      defaultCheckWindowDestroyed,
+      popoutForDefaultCheck,
+      isNewWindowInstance: Boolean(alwaysOnTopDefaultWindow) && alwaysOnTopDefaultWindow.id !== windowBeforeDefaultCheck.id,
+      alwaysOnTopDefaultValue,
+      pass:
+        defaultCheckWindowDestroyed === true &&
+        popoutForDefaultCheck.ok === true &&
+        Boolean(alwaysOnTopDefaultWindow) &&
+        alwaysOnTopDefaultWindow.id !== windowBeforeDefaultCheck.id &&
+        alwaysOnTopDefaultValue === false,
+    };
+    if (!steps.alwaysOnTopDefault.pass) return await finishM3WindowProbe(steps, "always-on-top-default-failed");
+
+    // 8. トレイの click ハンドラと同じ関数を直接呼ぶ (tray-probe の autoLaunchToggle 検証と同じ
+    //    流儀: trayMenuTemplate() は状態を持たない純関数なので、実トレイを作らないこのモード
+    //    (trayEnabled=false, isTestRunnerMode 参照) からも同じ click 関数参照をそのまま呼べる)。
+    //    1 回目で true、2 回目で false に戻ることを確認する。
+    const findAlwaysOnTopMenuItem = () =>
+      trayMenuTemplate().find((item) => item.label === CALL_WINDOW_ALWAYS_ON_TOP_MENU_LABEL);
+    const menuItemFound = Boolean(findAlwaysOnTopMenuItem());
+    findAlwaysOnTopMenuItem()?.click();
+    const afterFirstToggle = state.callWindow.isAlwaysOnTop();
+    findAlwaysOnTopMenuItem()?.click();
+    const afterSecondToggle = state.callWindow.isAlwaysOnTop();
+    steps.alwaysOnTopToggle = {
+      menuItemFound,
+      afterFirstToggle,
+      afterSecondToggle,
+      pass: menuItemFound && afterFirstToggle === true && afterSecondToggle === false,
+    };
+    if (!steps.alwaysOnTopToggle.pass) return await finishM3WindowProbe(steps, "always-on-top-toggle-failed");
+
+    // 9. 永続化の検証: 設定を true にした状態で callWindow を実際に破棄→再生成し、生成直後
+    //    (setAlwaysOnTop() を明示的に呼び直す前) から true になっていることを見る -- step 7 と同じ
+    //    close=復帰 + 再 popout の経路。
+    findAlwaysOnTopMenuItem()?.click(); // step 8 の終値 (false) → true
+    const alwaysOnTopBeforeRecreate = state.callWindow.isAlwaysOnTop();
+    const windowBeforeRecreate = state.callWindow;
+    windowBeforeRecreate.close();
+    const recreateSourceDestroyed = await waitForM3SpikeCondition(
+      () => !windowBeforeRecreate || windowBeforeRecreate.isDestroyed(),
+      8000,
+    );
+    await wait(300);
+    const popoutForRecreate = await win.webContents.executeJavaScript(
+      `window.__selfmatrixM3WindowProbe.transport.popoutCallView()
+        .then(() => ({ ok: true }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const recreatedWindow = state.callWindow;
+    const alwaysOnTopAfterRecreate =
+      Boolean(recreatedWindow) && !recreatedWindow.isDestroyed() ? recreatedWindow.isAlwaysOnTop() : null;
+    steps.alwaysOnTopPersistAcrossRecreate = {
+      alwaysOnTopBeforeRecreate,
+      recreateSourceDestroyed,
+      popoutForRecreate,
+      isNewWindowInstance: Boolean(recreatedWindow) && recreatedWindow.id !== windowBeforeRecreate.id,
+      alwaysOnTopAfterRecreate,
+      pass:
+        alwaysOnTopBeforeRecreate === true &&
+        recreateSourceDestroyed === true &&
+        popoutForRecreate.ok === true &&
+        Boolean(recreatedWindow) &&
+        recreatedWindow.id !== windowBeforeRecreate.id &&
+        alwaysOnTopAfterRecreate === true,
+    };
+
+    // 後始末: evidence/.test-userdata は test-runner モード間で共有される (上記コメント参照)。
+    // このステップが true のまま終わっても次回実行時は step 7 の unlinkSync が既定 OFF 検証を
+    // 決定的にするので実害は無いが、他 probe が誤ってこの設定ファイルを読む余地を残さないよう
+    // pass/fail に関係なくベストエフォートで既定へ戻しておく。
+    try {
+      saveCallWindowAlwaysOnTopEnabled(false);
+      if (state.callWindow && !state.callWindow.isDestroyed()) state.callWindow.setAlwaysOnTop(false);
+    } catch (error) {
+      // ベストエフォート。
+    }
 
     return await finishM3WindowProbe(steps, null);
   } catch (error) {
