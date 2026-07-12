@@ -4,8 +4,19 @@ try {
 } catch (error) {
   if (require.main === module) throw error;
 }
-const { app, BrowserWindow, WebContentsView, desktopCapturer, ipcMain, session, shell, Tray, Menu, nativeImage } =
-  electron;
+const {
+  app,
+  BrowserWindow,
+  WebContentsView,
+  desktopCapturer,
+  globalShortcut,
+  ipcMain,
+  session,
+  shell,
+  Tray,
+  Menu,
+  nativeImage,
+} = electron;
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
@@ -275,6 +286,12 @@ if (isM3WindowProbe) {
   });
 }
 
+// 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1/§4.4、運用者確定要件
+// 2026-07-12): グローバルホットキー/トレイ導線の検証専用モード。OS のグローバルホットキー実打鍵や
+// トレイの実クリックは自動化できないため、tray-probe と同じ方針 (ロジック本体を main プロセス内から
+// 直接呼んで機械的に検証する) を踏襲する。runExternalMuteProbe() 参照。
+const isExternalMuteProbe = process.argv.includes("--external-mute-probe");
+
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
 // smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
@@ -289,9 +306,27 @@ if (isM3WindowProbe) {
 // app.exit() を呼んでライフサイクルを自己管理する自己完結モードであり (tray-probe 等と同じ形)、
 // close-to-tray やトレイ生成は不要 (むしろ callWindow.close() の実測を close-to-tray の横取りから
 // 独立させたい)。
+// 外部ミュート制御 (--external-mute-probe) も userData 隔離の対象に加える (isExternalMuteProbe の
+// コメント参照)。決定的な検証のため実プロファイルの永続化ファイルに一切触れずに済ませたい —
+// evidence/.test-userdata (.gitignore 済み) へ隔離することで、開発者の実ホットキー設定を読んでテスト
+// 実行のたびに本物の OS グローバルホットキーを誤って登録する事故を防ぐ。
 const isTestRunnerMode =
-  isSmoke || isMemoryProbe || isCinnyShellSmoke || isE2ERealJoin || isHarness || isM3CloseSpike || isM3WindowProbe;
+  isSmoke ||
+  isMemoryProbe ||
+  isCinnyShellSmoke ||
+  isE2ERealJoin ||
+  isHarness ||
+  isM3CloseSpike ||
+  isM3WindowProbe ||
+  isExternalMuteProbe;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
+
+// グローバルホットキーの起動時自動適用 (applyExternalMuteHotkeyFromPersistedState()) は本番相当の
+// 起動でのみ行う。tray-probe は isTestRunnerMode に含まれず (userData が実プロファイルのまま) 実運用
+// の永続化ファイルを読んでしまうため、テスト実行のたびに本物の OS グローバルホットキーを登録して
+// しまわないよう明示的に除外する。--external-mute-probe 自身は決定的な検証のため呼び出しタイミングを
+// runExternalMuteProbe() 側で自分で管理する (main() からは自動的に呼ばない)。
+const isExternalMuteHotkeyProductionRun = !isTestRunnerMode && !isTrayProbe;
 
 // M3 step 2 (窓サイズ/位置記憶): app.getPath("userData") は既定でこの OS ユーザーの実プロファイル
 // ディレクトリ (例 Windows の %APPDATA%/SelfMatrix) を指す。callWindow の bounds 永続化
@@ -315,6 +350,21 @@ const trayEnabled = isTrayProbe || !isTestRunnerMode;
 const hasExplicitUserDataDir = process.argv.some((a) => a.startsWith("--user-data-dir"));
 if (app && isTestRunnerMode && !hasExplicitUserDataDir) {
   app.setPath("userData", path.join(evidenceDir, ".test-userdata"));
+}
+
+// 外部ミュート制御検証 (--external-mute-probe) 専用: 決定的な検証のため、起動のたびに前回実行の
+// 残留設定ファイルを消してから始める。evidence/.test-userdata は npm test の各モード間で使い回される
+// ため (per-instance の mkdtemp ではない、上のコメント参照)、放置すると「既定 OFF」の検証が前回の
+// ON 状態を引きずって偽 PASS/FAIL になる。ファイル名はこの下で定義する
+// EXTERNAL_MUTE_HOTKEY_STATE_FILENAME と同一の文字列リテラルを直接使う (関数宣言はホイストされるが、
+// このファイル名定数自体は `const` でホイストされないため、ここでは定数を参照せず直書きする)。
+if (app && isExternalMuteProbe) {
+  try {
+    fs.unlinkSync(path.join(app.getPath("userData"), "external-mute-hotkey.json"));
+  } catch (error) {
+    // 初回実行 (ファイルがまだ存在しない) は正常系。それ以外の失敗もベストエフォートで無視する
+    // (この後の runExternalMuteProbe() 側の各アサーションが不整合を検知する)。
+  }
 }
 
 // M2 3b electron-updater 配線: shouldEnableAutoUpdater() (update-apply-gate.cjs) の isTestMode
@@ -359,7 +409,10 @@ function e2eOffscreenBrowserWindowOptions() {
   // 出ることを避けたい (test-run-preferences と同じ運用者方針) ので同じ扱いに加える。
   // M3 step 1/2 検証 (--m3-window-probe) も同じ理由 (callWindow の popout/resize/close を実際に
   // 駆動する) で加える。
-  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe) return {};
+  // 外部ミュート制御検証 (--external-mute-probe) も同じ理由 (実 mainWindow.webContents へ実際に
+  // IPC を届けて受信を確認する) で加える。
+  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe && !isExternalMuteProbe)
+    return {};
   return { x: E2E_OFFSCREEN_WINDOW_POSITION.x, y: E2E_OFFSCREEN_WINDOW_POSITION.y };
 }
 
@@ -527,6 +580,14 @@ const state = {
   // ここへ積む診断ログ (evidence/probe 用。実際の push 配信は state.mainWindow.webContents.send()
   // が担う — pushCallViewPlacement() 参照)。
   callViewPlacementPushLog: [],
+  // 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1): globalShortcut.register() が
+  // 実際に成功したアクセラレータ文字列 (例 "Ctrl+Alt+M")。未登録時は null。トレイの「ホットキー」
+  // サブメニューの checkbox の checked はこの値 (「実際に登録されているか」の実測) から導出する
+  // (永続化ファイルの enabled フラグだけを見ると、register() 失敗時に無言で食い違う — 運用者確定
+  // 要件 3 の「無言で効かない状態を作らない」に対応)。プリセット切替時に「旧アクセラレータを
+  // unregister する」ためにも使う (どの文字列で登録されているかを main プロセス自身が把握しておく
+  // 必要がある)。
+  externalMuteHotkeyRegisteredAccelerator: null,
 };
 
 // M2 bounds sync: state.callViewBoundsApplyLog の保持上限 (evidence/メモリの肥大化防止。
@@ -544,8 +605,28 @@ if (app) {
     // (runM3CloseSpikeProbe() が callWindow.close() を実際に呼ぶため、mainWindow が生き残っていても
     // 万一 window-all-closed が発火した場合に evidence 書き出し前で終了させないための保険)。
     // runM3WindowProbe() (--m3-window-probe) も同じ理由 (popoutCallView()/close=復帰の実駆動) で除外。
-    if (!isSmoke && !isMemoryProbe && !isCinnyShellSmoke && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe)
+    // runExternalMuteProbe() (--external-mute-probe) も同じ理由 (自分の末尾で app.exit() を呼んで
+    // ライフサイクルを自己管理する) で除外する。
+    if (
+      !isSmoke &&
+      !isMemoryProbe &&
+      !isCinnyShellSmoke &&
+      !isTrayProbe &&
+      !isM3CloseSpike &&
+      !isM3WindowProbe &&
+      !isExternalMuteProbe
+    )
       app.quit();
+  });
+
+  // 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1、運用者確定要件 2026-07-12
+  // 項目4): アプリ終了時に登録済みのグローバルホットキーを必ず解放する。globalShortcut は
+  // プロセスが本当に終了すれば OS 側でも自然に解放されるが、「無言で放置しない」の一環として明示的に
+  // unregisterAll() する。isSmoke 等の run*Probe() 系は自分の末尾で app.exit() (will-quit を発火
+  // させない強制終了) を呼ぶため、runExternalMuteProbe() 側でも同じ後始末を個別に行う
+  // (このハンドラだけに依存しない、同ファイル該当コメント参照)。
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
   });
 }
 
@@ -1057,6 +1138,174 @@ function saveCallWindowAlwaysOnTopEnabled(enabled) {
   }
 }
 
+// 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1、運用者確定要件 2026-07-12)。
+//
+// 既定キーバインドの選定理由 (運用者確定要件 1): 運用者の当初の例示は「右Shift+M」だったが、
+// Electron の globalShortcut は accelerator の左右修飾キーを区別できない仕様
+// (https://www.electronjs.org/docs/latest/api/accelerator) のため「右Shift」だけを狙って登録する
+// ことができない。素の "Shift+M" も採用できない -- 修飾キー無しの Shift+M は OS 全体で大文字 M の
+// 入力そのもの (他の全アプリのテキスト入力中の Shift+M) を横取りしてしまい実用に耐えない。そのため
+// 既定は他アプリと衝突しにくい "Ctrl+Alt+M" 系の組み合わせにする。
+//
+// プリセット切替 (2026-07-12 運用者要件変更): トレイの「ホットキー」サブメニューから 4 択で切替
+// できるようにする。F13/F14 を選択肢に含めるのは、物理キーボードにはほぼ存在せず (Stream Deck や
+// 一部の拡張キーボード以外では実キー入力と衝突しない)、かつ Stream Deck の標準「Hotkey」システム
+// アクションが仮想的に送出できるキーだから -- Discord ユーザーが F13〜F24 系の余りキーを
+// グローバルホットキーに使う慣習 (design/external-mute-control.md §3.2) と同じ発想。
+const EXTERNAL_MUTE_HOTKEY_PRESETS = Object.freeze([
+  { id: "ctrl+alt+m", accelerator: "Ctrl+Alt+M", radioLabel: "Ctrl+Alt+M" },
+  { id: "ctrl+shift+m", accelerator: "Ctrl+Shift+M", radioLabel: "Ctrl+Shift+M" },
+  { id: "f13", accelerator: "F13", radioLabel: "F13 (Stream Deck 向け)" },
+  { id: "f14", accelerator: "F14", radioLabel: "F14 (Stream Deck 向け)" },
+]);
+const DEFAULT_EXTERNAL_MUTE_HOTKEY_PRESET_ID = "ctrl+alt+m";
+// 運用者要件変更 (2026-07-12): 既定は OFF。ユーザーがトレイから明示的に ON にする。
+const DEFAULT_EXTERNAL_MUTE_HOTKEY_STATE = Object.freeze({
+  enabled: false,
+  preset: DEFAULT_EXTERNAL_MUTE_HOTKEY_PRESET_ID,
+});
+
+function findExternalMuteHotkeyPreset(presetId) {
+  return (
+    EXTERNAL_MUTE_HOTKEY_PRESETS.find((preset) => preset.id === presetId) ||
+    EXTERNAL_MUTE_HOTKEY_PRESETS.find((preset) => preset.id === DEFAULT_EXTERNAL_MUTE_HOTKEY_PRESET_ID)
+  );
+}
+
+// callWindowAlwaysOnTopStateFilePath() と同じ「別ファイルに分離」方針 (bounds のような高頻度書き込み
+// と混ぜない) を踏襲するが、こちらはそもそも高頻度書き込みが存在しない設定なので単純にトピックで
+// 分けているだけ -- 「有効/無効」と「選択プリセット」の両方を同じ 1 ファイルにまとめて持つ
+// (どちらもトレイメニューのクリック 1 回につき高々 1 回しか変わらない離散イベントで、頻度の非対称が
+// 無いため分離する理由が無い)。
+const EXTERNAL_MUTE_HOTKEY_STATE_FILENAME = "external-mute-hotkey.json";
+
+function externalMuteHotkeyStateFilePath() {
+  return path.join(app.getPath("userData"), EXTERNAL_MUTE_HOTKEY_STATE_FILENAME);
+}
+
+// loadCallWindowState()/loadCallWindowAlwaysOnTopEnabled() と同じ fail-safe 方針: 保存されていない/
+// 壊れている/不正な値であれば既定値へフォールバックする (プリセット ID が現行の 4 択に無い場合も
+// 同様、将来プリセットを削除/改名した場合の互換性のため)。
+function loadExternalMuteHotkeyState() {
+  try {
+    const raw = fs.readFileSync(externalMuteHotkeyStateFilePath(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed)) return { ...DEFAULT_EXTERNAL_MUTE_HOTKEY_STATE };
+    const enabled = parsed.enabled === true;
+    const presetIsKnown = EXTERNAL_MUTE_HOTKEY_PRESETS.some((preset) => preset.id === parsed.preset);
+    const presetId = presetIsKnown ? parsed.preset : DEFAULT_EXTERNAL_MUTE_HOTKEY_PRESET_ID;
+    return { enabled, preset: presetId };
+  } catch (error) {
+    return { ...DEFAULT_EXTERNAL_MUTE_HOTKEY_STATE };
+  }
+}
+
+// saveCallWindowAlwaysOnTopEnabled() と同じくデバウンスしない (トレイメニューのクリック 1 回につき
+// 高々 1 回しか呼ばれない離散イベント)。
+function saveExternalMuteHotkeyState(nextState) {
+  try {
+    fs.mkdirSync(app.getPath("userData"), { recursive: true });
+    fs.writeFileSync(
+      externalMuteHotkeyStateFilePath(),
+      `${JSON.stringify(nextState, null, 2)}\n`,
+      "utf8",
+    );
+  } catch (error) {
+    // ベストエフォート -- 永続化の失敗 (書き込み権限等) でトレイのトグル/切替操作自体を止めない。
+    state.widgetMessages.push({
+      t: Date.now(),
+      type: "external-mute-hotkey-save-error",
+      error: String(error && error.message ? error.message : error),
+    });
+  }
+}
+
+// design/external-mute-control.md §4.4「配送経路の後半」: 引き金 (ホットキー callback / トレイの
+// アクション項目「マイクミュート切り替え」の click) は必ずこの 1 関数に集約する。main プロセスは
+// 「押されたことを検知する」役割に徹し、実際のミュート操作は cinny (mainWindow の renderer) 側の
+// callEmbedAtom 経由の toggleMicrophone() に委譲する (design §4.1)。将来の選択肢 B (ローカル制御 API)
+// もこの同じ関数を再利用する前提の構造 -- 引き金の種類が増えても、この集約点は増やさない。
+function triggerExternalMuteToggle() {
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+    state.mainWindow.webContents.send("native:external-mute-toggle");
+  }
+}
+
+// globalShortcut.register() の戻り値 (成功/失敗) を必ず確認する (design §4.1: 「アクセラレータが
+// 既に他アプリに取られている場合はサイレントに失敗する」という Electron の仕様上の挙動があるため)。
+// 成功時のみ state.externalMuteHotkeyRegisteredAccelerator を更新する -- 失敗時は「登録されていない」
+// ままにしておくことで、トレイの checkbox の checked (この値から導出) が実態と食い違わない。
+function registerExternalMuteHotkey(accelerator) {
+  const ok = globalShortcut.register(accelerator, triggerExternalMuteToggle);
+  if (ok) {
+    state.externalMuteHotkeyRegisteredAccelerator = accelerator;
+  } else {
+    // 運用者確定要件 3: 「無言で効かない状態を作らない」-- 最低限 console へ warn する。
+    console.warn(
+      `[external-mute] globalShortcut.register("${accelerator}") failed ` +
+        "(likely already taken by another app or the OS). External mute hotkey stays disabled.",
+    );
+  }
+  return ok;
+}
+
+function unregisterExternalMuteHotkeyIfRegistered() {
+  const accelerator = state.externalMuteHotkeyRegisteredAccelerator;
+  if (accelerator) {
+    globalShortcut.unregister(accelerator);
+    state.externalMuteHotkeyRegisteredAccelerator = null;
+  }
+}
+
+// main() 起動時に一度だけ呼ばれる (isExternalMuteHotkeyProductionRun のときだけ、定義箇所コメント
+// 参照)。永続化されている enabled が true のときだけ実際に登録を試みる (既定 OFF なので初回起動時は
+// 何もしない)。
+function applyExternalMuteHotkeyFromPersistedState() {
+  const persisted = loadExternalMuteHotkeyState();
+  if (!persisted.enabled) return;
+  const preset = findExternalMuteHotkeyPreset(persisted.preset);
+  const ok = registerExternalMuteHotkey(preset.accelerator);
+  if (!ok) {
+    // 登録失敗時は永続化状態も false に落とし、次回起動時に「ON のはずなのに効いていない」という
+    // 混乱を残さない (運用者確定要件 3)。
+    saveExternalMuteHotkeyState({ enabled: false, preset: preset.id });
+  }
+}
+
+// トレイの「ホットキー」サブメニュー内 checkbox 項目「ミュート: <プリセット>」の click ハンドラ本体
+// (運用者確定要件 3)。現在値は毎回永続化ファイルから実測して反転させる (toggleAutoLaunch()/
+// toggleCallWindowAlwaysOnTop() と同じ流儀)。
+function toggleExternalMuteHotkeyEnabled() {
+  const persisted = loadExternalMuteHotkeyState();
+  const preset = findExternalMuteHotkeyPreset(persisted.preset);
+  if (persisted.enabled) {
+    unregisterExternalMuteHotkeyIfRegistered();
+    saveExternalMuteHotkeyState({ enabled: false, preset: preset.id });
+    return;
+  }
+  const ok = registerExternalMuteHotkey(preset.accelerator);
+  // register() が失敗した場合は enabled:false のまま永続化する (運用者確定要件 3、
+  // registerExternalMuteHotkey() のコメント参照)。
+  saveExternalMuteHotkeyState({ enabled: ok, preset: preset.id });
+}
+
+// トレイの「ホットキー」サブメニュー内プリセット (radio) 項目の click ハンドラ本体 (2026-07-12
+// 運用者要件変更)。ON 状態で切り替える場合は旧アクセラレータを unregister してから新アクセラレータを
+// register する -- 失敗時は checkbox 側と同じく enabled を false に落として warn する
+// (registerExternalMuteHotkey() が既に warn する)。OFF 状態なら選択の保存のみ行う。
+function selectExternalMuteHotkeyPreset(presetId) {
+  const persisted = loadExternalMuteHotkeyState();
+  if (persisted.preset === presetId) return;
+  const nextPreset = findExternalMuteHotkeyPreset(presetId);
+  if (!persisted.enabled) {
+    saveExternalMuteHotkeyState({ enabled: false, preset: nextPreset.id });
+    return;
+  }
+  unregisterExternalMuteHotkeyIfRegistered();
+  const ok = registerExternalMuteHotkey(nextPreset.accelerator);
+  saveExternalMuteHotkeyState({ enabled: ok, preset: nextPreset.id });
+}
+
 // M3 step 1 (design §3-5「placement 状態の逆方向 push」): call view の attach 先
 // ("main" | "window" | "none"、computeCallViewAttachedTo() が実contentView階層から逆算する値) を
 // mainWindow (shell-preload.cjs 経由で cinny) へ push する。detachCallView()/attachCallView()/
@@ -1367,14 +1616,61 @@ function toggleCallWindowAlwaysOnTop() {
 
 const CALL_WINDOW_ALWAYS_ON_TOP_MENU_LABEL = "通話の別窓を最前面に固定";
 
+// 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1 末尾「補助的な最小実装」、
+// 運用者確定要件 2026-07-12 項目2): トレイ右クリックメニューのアクション項目。click のたびに
+// triggerExternalMuteToggle() (ホットキー callback と全く同じ関数) を呼ぶ -- グローバルホットキーとは
+// 独立した経路 (キー衝突の心配が無い)。通話中でなければ cinny 側で自然に no-op になる。
+const EXTERNAL_MUTE_ACTION_MENU_LABEL = "マイクミュート切り替え";
+// 運用者確定要件 3: ホットキーの発見性のためのサブメニュー。
+const EXTERNAL_MUTE_HOTKEY_SUBMENU_LABEL = "ホットキー";
+
 // トレイの右クリックメニュー定義。「将来ミュート制御等を足せる構造にしておく」という要件どおり、
 // 項目は配列で持つ (増やす場合はこの配列に追記するだけでよい)。状態を持たない純関数として書いて
-// あるので、createTray() が実際にトレイへ設定するのと runTrayProbe() が検証用に取得するのとで
-// 常に同じ定義になる (checked の初期値だけは currentAutoLaunchEnabled() 経由で実際の OS 状態を
-// 読むが、これは読み取り専用でありメニュー生成そのものに副作用は無い)。
+// あるので、createTray() が実際にトレイへ設定するのと runTrayProbe()/runExternalMuteProbe() が
+// 検証用に取得するのとで常に同じ定義になる (checked/label の初期値だけは
+// currentAutoLaunchEnabled()/loadExternalMuteHotkeyState() 等で実際の状態を読むが、これは読み取り
+// 専用でありメニュー生成そのものに副作用は無い)。
+//
+// 外部ミュート制御のホットキー checkbox/プリセット radio はラベルや checked が状態変化のたびに
+// 変わる (プリセット切替でラベル文字列自体が変わる) ため、click ハンドラは状態変更後に
+// refreshTrayMenu() を呼んでメニュー全体を再構築する -- AUTO_LAUNCH_MENU_LABEL 等の静的ラベル項目は
+// Electron の Menu 自身の自動チェック反転に任せているのと対照的 (toggleAutoLaunch() のコメント参照)。
 function trayMenuTemplate() {
+  const externalMuteState = loadExternalMuteHotkeyState();
+  const currentPreset = findExternalMuteHotkeyPreset(externalMuteState.preset);
   return [
     { label: "SelfMatrix を開く", click: () => handleTrayActivate() },
+    { type: "separator" },
+    { label: EXTERNAL_MUTE_ACTION_MENU_LABEL, click: () => triggerExternalMuteToggle() },
+    {
+      label: EXTERNAL_MUTE_HOTKEY_SUBMENU_LABEL,
+      submenu: [
+        {
+          label: `ミュート: ${currentPreset.accelerator}`,
+          type: "checkbox",
+          // 運用者確定要件 3: checked は「ホットキー登録済み」の実測値 (実際に
+          // globalShortcut.register() が成功しているか) から導出する。永続化ファイルの enabled を
+          // そのまま使わないのは、register() 失敗時 (他アプリとのキー衝突) にも checked が
+          // 見た目上 ON のままになってしまう食い違いを避けるため (registerExternalMuteHotkey()の
+          // コメント参照)。
+          checked: state.externalMuteHotkeyRegisteredAccelerator !== null,
+          click: () => {
+            toggleExternalMuteHotkeyEnabled();
+            refreshTrayMenu();
+          },
+        },
+        { type: "separator" },
+        ...EXTERNAL_MUTE_HOTKEY_PRESETS.map((preset) => ({
+          label: preset.radioLabel,
+          type: "radio",
+          checked: preset.id === externalMuteState.preset,
+          click: () => {
+            selectExternalMuteHotkeyPreset(preset.id);
+            refreshTrayMenu();
+          },
+        })),
+      ],
+    },
     { type: "separator" },
     { label: AUTO_LAUNCH_MENU_LABEL, type: "checkbox", checked: currentAutoLaunchEnabled(), click: () => toggleAutoLaunch() },
     {
@@ -1398,6 +1694,17 @@ function createTray() {
   tray.on("double-click", handleTrayActivate);
   state.tray = tray;
   return tray;
+}
+
+// 外部ミュート制御のホットキー checkbox/プリセット radio のように、状態変化のたびにラベル/checked が
+// 変わる項目を持つメニューを再構築する。AUTO_LAUNCH_MENU_LABEL 等の静的ラベル項目は Electron の Menu
+// 自身の自動チェック反転に任せているため、この再構築は無くても実害は無いが (トレイを再度開けば次回の
+// trayMenuTemplate() 呼び出しで最新化される)、即座に見た目を合わせるために毎回呼ぶ。tray-probe/
+// external-mute-probe のように実 Tray を生成しないモードでは state.tray が null のまま (trayEnabled
+// の定義参照) なので no-op になる。
+function refreshTrayMenu() {
+  if (!state.tray || state.tray.isDestroyed()) return;
+  state.tray.setContextMenu(Menu.buildFromTemplate(trayMenuTemplate()));
 }
 
 // M1 step 3b: harness/smoke 用の既定 widget パラメータで完成 URL を組み立てる汎用ヘルパー。
@@ -3497,11 +3804,26 @@ async function runTrayProbe() {
   // 純関数) をもう一度取得してラベル一覧を記録する。createTray() が使ったものと常に同じ形になる。
   const menuTemplate = trayMenuTemplate();
   const menuLabels = menuTemplate.map((item) => item.label ?? null);
+  // 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1、運用者確定要件 2026-07-12):
+  // トレイ右クリックメニューにアクション項目「マイクミュート切り替え」とサブメニュー「ホットキー」が
+  // 追加されたので、tray-probe のラベル期待値もここで更新する (実際の登録/トグル/プリセット切替の
+  // 挙動検証は --external-mute-probe/runExternalMuteProbe() 側の責務、ここではメニュー構造の存在だけ
+  // 確認する)。
+  const hotkeySubmenuItem = menuTemplate.find((item) => item.label === EXTERNAL_MUTE_HOTKEY_SUBMENU_LABEL);
+  const hotkeySubmenuLabels = Array.isArray(hotkeySubmenuItem?.submenu)
+    ? hotkeySubmenuItem.submenu.map((item) => item.label ?? null)
+    : [];
   const contextMenuItems = {
     labels: menuLabels,
     containsOpenLabel: menuLabels.some((label) => typeof label === "string" && label.includes("開く")),
     containsQuitLabel: menuLabels.some((label) => typeof label === "string" && label.includes("終了")),
     containsAutoLaunchLabel: menuLabels.some((label) => label === AUTO_LAUNCH_MENU_LABEL),
+    containsExternalMuteActionLabel: menuLabels.some((label) => label === EXTERNAL_MUTE_ACTION_MENU_LABEL),
+    containsExternalMuteHotkeySubmenuLabel: menuLabels.some((label) => label === EXTERNAL_MUTE_HOTKEY_SUBMENU_LABEL),
+    hotkeySubmenuLabels,
+    hotkeySubmenuHasAllPresetRadios: EXTERNAL_MUTE_HOTKEY_PRESETS.every((preset) =>
+      hotkeySubmenuLabels.includes(preset.radioLabel),
+    ),
   };
 
   // trayClickShowsWindow: closeHidesWindow のステップで隠した (または壊れて破棄された)
@@ -3632,6 +3954,9 @@ async function runTrayProbe() {
       contextMenuItems.containsOpenLabel &&
       contextMenuItems.containsQuitLabel &&
       contextMenuItems.containsAutoLaunchLabel &&
+      contextMenuItems.containsExternalMuteActionLabel &&
+      contextMenuItems.containsExternalMuteHotkeySubmenuLabel &&
+      contextMenuItems.hotkeySubmenuHasAllPresetRadios &&
       trayClickShowsWindow &&
       notificationClickFocusesWindow &&
       autoLaunchToggle.pass &&
@@ -3651,6 +3976,261 @@ async function runTrayProbe() {
 
   fs.mkdirSync(evidenceDir, { recursive: true });
   fs.writeFileSync(path.join(evidenceDir, "tray-probe-result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  state.tray?.destroy();
+  state.sourcePickerWindow?.destroy();
+  state.callWindow?.destroy();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
+  state.server?.close();
+  app.exit(result.pass ? 0 : 1);
+}
+
+// mainWindow の main world (shell-preload.cjs 経由で contextBridge 公開された
+// window.selfmatrixNative) 側で、claim 済みトランスポートの onExternalMuteToggle() リスナーが
+// これまでに受け取った回数を読む。runExternalMuteProbe() の各ステップから繰り返し呼ばれる。
+async function readExternalMuteToggleEventCount(win) {
+  return win.webContents.executeJavaScript(
+    "(window.__selfmatrixExternalMuteToggleEvents || []).length",
+    true,
+  );
+}
+
+// 外部ミュート制御 選択肢 A の検証専用モード (--external-mute-probe, design/external-mute-control.md
+// §4.1/§4.4、運用者確定要件 2026-07-12)。OS のグローバルホットキーの実打鍵や Stream Deck の実操作は
+// 自動化できないため、tray-probe と同じ方針 (ロジック本体 -- globalShortcut 登録/解除、トレイの click
+// ハンドラと同一の引き金関数、mainWindow への IPC 配送 -- を main プロセス内から直接呼んで機械的に
+// 検証する) を踏襲する。
+//
+// 検証する内容 (完了報告の宛先の記号に対応):
+//   a. 起動時、既定 (初回インストール相当) では isRegistered(既定アクセラレータ) が false のまま
+//      (2026-07-12 運用者要件変更: 既定 ON → 既定 OFF)。
+//   b. トレイの「ホットキー」checkbox の click ハンドラと同一の関数 (toggleExternalMuteHotkeyEnabled())
+//      で ON/OFF をトグルできる。ON にすると isRegistered が true になり、永続化される (再起動相当
+//      ―― globalShortcut.unregisterAll() で一旦解放してから applyExternalMuteHotkeyFromPersistedState()
+//      を再実行する -- で復元される)。OFF に戻すと isRegistered が false になり、同様に永続化/復元
+//      される。
+//   c. トレイのアクション項目「マイクミュート切り替え」の click ハンドラ (= ホットキー callback と
+//      全く同じ triggerExternalMuteToggle()) を呼ぶと、mainWindow の renderer 側が実際に
+//      native:external-mute-toggle を受信する (window.selfmatrixNative.claimWidgetTransport().
+//      onExternalMuteToggle() 経由、shell-preload.cjs の実装を実際に駆動して検証する)。
+//   d. 変異ゲート: 「マイクミュート切り替え」項目 → triggerExternalMuteToggle() の配線を一時的に
+//      壊し (triggerExternalMuteToggle を no-op へ差し替える)、その状態でクリックしても renderer が
+//      受信しない (= 壊れたことを検知できる) ことを確認してから元へ戻し、再び PASS することを確認する。
+//   e. プリセット切替 (selectExternalMuteHotkeyPreset()、トレイの radio 項目の click ハンドラと同一)
+//      後は isRegistered(新プリセット) が true、isRegistered(旧プリセット) が false になる。
+//   f. 選択プリセットが永続化され、再起動相当 (unregisterAll → 再適用) で復元される。
+//   g. (前提条件、requirement 4) will-quit ハンドラを合成 emit すると globalShortcut.unregisterAll()
+//      が実際に呼ばれ、登録中だったアクセラレータが解放される。
+//   h. (前提条件) ホットキー callback とトレイのアクション項目は globalShortcut.register() に渡す
+//      時点で同一の関数オブジェクト (triggerExternalMuteToggle) を共有している (design §4.1
+//      「同一の関数に集約」の構造的な裏付け)。
+async function runExternalMuteProbe() {
+  const win = state.mainWindow;
+  const DEFAULT_PRESET = findExternalMuteHotkeyPreset(DEFAULT_EXTERNAL_MUTE_HOTKEY_PRESET_ID);
+  const ALT_PRESET = findExternalMuteHotkeyPreset("f13");
+
+  // 前提: このプロセス自身は起動時 (main() の isExternalMuteHotkeyProductionRun ゲート、
+  // 定義箇所コメント参照) にこの関数を自動的には呼ばない -- 決定的な検証のため、ここから先は
+  // すべてこの関数自身が明示的に呼び出しタイミングを制御する。念のため、まだ何も登録されていない
+  // (userData のリセットは main() 冒頭で既に実施済み、isExternalMuteProbe の reset ブロック参照)
+  // クリーンな状態から始める。
+  globalShortcut.unregisterAll();
+  state.externalMuteHotkeyRegisteredAccelerator = null;
+
+  // renderer 側の受信を実測するためのリスナーを仕込む (design §4.1 のとおり claim-once の
+  // トランスポート経由)。claimWidgetTransport() はこのプロセスで初回なので成功する
+  // (NativeCallEmbed 相当の呼び出しはこの probe では一切発生しない)。
+  const setupResult = await win.webContents.executeJavaScript(
+    `(() => {
+      try {
+        window.__selfmatrixExternalMuteToggleEvents = [];
+        const transport = window.selfmatrixNative.claimWidgetTransport();
+        const hasMethod = typeof transport.onExternalMuteToggle === "function";
+        if (hasMethod) {
+          transport.onExternalMuteToggle(() => {
+            window.__selfmatrixExternalMuteToggleEvents.push(Date.now());
+          });
+        }
+        return { ok: true, hasMethod };
+      } catch (error) {
+        return { ok: false, error: String(error && error.message ? error.message : error) };
+      }
+    })()`,
+    true,
+  );
+
+  // a. 既定 OFF (2026-07-12 運用者要件変更): main() が本番起動時に呼ぶのと同じ関数を、リセット済みの
+  // (userData 上に設定ファイルが無い) 状態に対して呼ぶ。
+  applyExternalMuteHotkeyFromPersistedState();
+  const defaultOff = {
+    isRegistered: globalShortcut.isRegistered(DEFAULT_PRESET.accelerator),
+    persistedEnabled: loadExternalMuteHotkeyState().enabled,
+  };
+  defaultOff.pass = defaultOff.isRegistered === false && defaultOff.persistedEnabled === false;
+
+  // h. ホットキー callback とトレイのアクション項目クリックが同一の関数を共有していることの構造的
+  // 裏付け: globalShortcut.register() に実際に渡されたコールバック参照を捕捉し、
+  // triggerExternalMuteToggle (このモジュールスコープの共有関数) と同一オブジェクトであることを
+  // 確認する。
+  const originalGlobalShortcutRegister = globalShortcut.register.bind(globalShortcut);
+  let capturedHotkeyCallback = null;
+  globalShortcut.register = (accelerator, callback) => {
+    capturedHotkeyCallback = callback;
+    return originalGlobalShortcutRegister(accelerator, callback);
+  };
+  toggleExternalMuteHotkeyEnabled(); // OFF -> ON (副作用は下の toggleOn チェックで確認する)
+  globalShortcut.register = originalGlobalShortcutRegister;
+  const sharedTriggerFunction = {
+    hotkeySharesTriggerFunction: capturedHotkeyCallback === triggerExternalMuteToggle,
+  };
+
+  // b. トグル ON: isRegistered true + 永続化 + 再起動相当で復元。
+  const toggleOn = {
+    isRegisteredAfterToggleOn: globalShortcut.isRegistered(DEFAULT_PRESET.accelerator),
+    persistedAfterToggleOn: loadExternalMuteHotkeyState(),
+  };
+  globalShortcut.unregisterAll(); // 再起動相当の第一歩 (プロセス終了 = OS が解放する状態を模す)
+  state.externalMuteHotkeyRegisteredAccelerator = null;
+  applyExternalMuteHotkeyFromPersistedState(); // 再起動相当の第二歩 (起動時の自動適用)
+  toggleOn.isRegisteredAfterRestart = globalShortcut.isRegistered(DEFAULT_PRESET.accelerator);
+  toggleOn.pass =
+    toggleOn.isRegisteredAfterToggleOn === true &&
+    toggleOn.persistedAfterToggleOn.enabled === true &&
+    toggleOn.persistedAfterToggleOn.preset === DEFAULT_PRESET.id &&
+    toggleOn.isRegisteredAfterRestart === true;
+
+  // トグル OFF: isRegistered false + 永続化 + 再起動相当で復元 (b の後半、"同じ関数でトグル OFF")。
+  toggleExternalMuteHotkeyEnabled(); // ON -> OFF (トレイの checkbox click ハンドラと同一の関数)
+  const toggleOff = {
+    isRegisteredAfterToggleOff: globalShortcut.isRegistered(DEFAULT_PRESET.accelerator),
+    persistedAfterToggleOff: loadExternalMuteHotkeyState(),
+  };
+  globalShortcut.unregisterAll();
+  state.externalMuteHotkeyRegisteredAccelerator = null;
+  applyExternalMuteHotkeyFromPersistedState();
+  toggleOff.isRegisteredAfterRestart = globalShortcut.isRegistered(DEFAULT_PRESET.accelerator);
+  toggleOff.pass =
+    toggleOff.isRegisteredAfterToggleOff === false &&
+    toggleOff.persistedAfterToggleOff.enabled === false &&
+    toggleOff.isRegisteredAfterRestart === false;
+
+  // c/d 用に、再びホットキーを ON にしておく (プリセット切替検証や引き金検証はホットキーが ON の
+  // 状態で行うほうが「トレイのアクション項目は独立した経路」という設計意図をより強く検証できる)。
+  toggleExternalMuteHotkeyEnabled(); // OFF -> ON
+
+  // c. 引き金関数 (トレイのアクション項目「マイクミュート切り替え」の click ハンドラ、ホットキー
+  // callback と共有の triggerExternalMuteToggle()) を呼ぶと mainWindow が実際に受信する。
+  const actionItem = trayMenuTemplate().find((item) => item.label === EXTERNAL_MUTE_ACTION_MENU_LABEL);
+  const beforeTrigger = await readExternalMuteToggleEventCount(win);
+  actionItem.click();
+  await wait(200);
+  const afterTrigger = await readExternalMuteToggleEventCount(win);
+  const triggerDelivery = {
+    setupResult,
+    beforeTrigger,
+    afterTrigger,
+    pass: Boolean(setupResult.ok) && Boolean(setupResult.hasMethod) && afterTrigger === beforeTrigger + 1,
+  };
+
+  // d. 変異ゲート: 引き金 (トレイのアクション項目) → triggerExternalMuteToggle() → send の配線を
+  // 一時的に壊し、FAIL を実測してから復元し、再度 PASS することを確認する。
+  const originalTriggerExternalMuteToggle = triggerExternalMuteToggle;
+  // eslint-disable-next-line no-func-assign -- 意図的な一時差し替え (mutation gate)。下で必ず復元する。
+  triggerExternalMuteToggle = () => {};
+  const beforeMutated = await readExternalMuteToggleEventCount(win);
+  actionItem.click(); // 壊れた triggerExternalMuteToggle を呼ぶはずだが、何もしないので送信されない
+  await wait(200);
+  const afterMutated = await readExternalMuteToggleEventCount(win);
+  const mutationDetectsFailure = afterMutated === beforeMutated; // 増えていない = 変異を検知できた
+  // eslint-disable-next-line no-func-assign -- 復元。
+  triggerExternalMuteToggle = originalTriggerExternalMuteToggle;
+  const beforeRestored = await readExternalMuteToggleEventCount(win);
+  actionItem.click();
+  await wait(200);
+  const afterRestored = await readExternalMuteToggleEventCount(win);
+  const restoredPassesAgain = afterRestored === beforeRestored + 1;
+  const mutationGate = {
+    beforeMutated,
+    afterMutated,
+    mutationDetectsFailure,
+    beforeRestored,
+    afterRestored,
+    restoredPassesAgain,
+    pass: mutationDetectsFailure && restoredPassesAgain,
+  };
+
+  // e/f. プリセット切替 (2026-07-12 運用者要件変更): ホットキーは ON のまま (上の toggleExternalMuteHotkeyEnabled()
+  // 呼び出し直後の状態)、既定プリセットから ALT_PRESET (f13) へ切り替える。
+  selectExternalMuteHotkeyPreset(ALT_PRESET.id); // トレイの radio 項目の click ハンドラと同一の関数
+  const presetSwitch = {
+    isRegisteredNewAfterSwitch: globalShortcut.isRegistered(ALT_PRESET.accelerator),
+    isRegisteredOldAfterSwitch: globalShortcut.isRegistered(DEFAULT_PRESET.accelerator),
+    persistedAfterSwitch: loadExternalMuteHotkeyState(),
+  };
+  presetSwitch.passE =
+    presetSwitch.isRegisteredNewAfterSwitch === true && presetSwitch.isRegisteredOldAfterSwitch === false;
+
+  // f. 再起動相当で選択プリセットが復元される。
+  globalShortcut.unregisterAll();
+  state.externalMuteHotkeyRegisteredAccelerator = null;
+  applyExternalMuteHotkeyFromPersistedState();
+  presetSwitch.isRegisteredNewAfterRestart = globalShortcut.isRegistered(ALT_PRESET.accelerator);
+  presetSwitch.passF =
+    presetSwitch.persistedAfterSwitch.preset === ALT_PRESET.id && presetSwitch.isRegisteredNewAfterRestart === true;
+  presetSwitch.pass = presetSwitch.passE && presetSwitch.passF;
+
+  // g. will-quit ハンドラの合成 emit: 実際に globalShortcut.unregisterAll() が呼ばれ、登録中だった
+  // アクセラレータが解放されることを確認する (app.quit() 自体は呼ばない -- このプロセスは
+  // 自分自身の app.exit() でライフサイクルを自己管理する、他の run*Probe() と同じ方針)。
+  const registeredBeforeWillQuit = globalShortcut.isRegistered(ALT_PRESET.accelerator);
+  app.emit("will-quit");
+  await wait(50);
+  const registeredAfterWillQuit = globalShortcut.isRegistered(ALT_PRESET.accelerator);
+  const willQuitUnregistersAll = {
+    registeredBeforeWillQuit,
+    registeredAfterWillQuit,
+    pass: registeredBeforeWillQuit === true && registeredAfterWillQuit === false,
+  };
+  state.externalMuteHotkeyRegisteredAccelerator = null;
+
+  // 後始末: このプロセス自身が持つ「実際に登録した」ものは will-quit の合成 emit で既に解放済み
+  // だが、二重に安全側へ倒す。永続化ファイルも既定へ戻し、evidence/.test-userdata に次回実行を
+  // 混乱させる残留状態を残さない。
+  globalShortcut.unregisterAll();
+  saveExternalMuteHotkeyState({ ...DEFAULT_EXTERNAL_MUTE_HOTKEY_STATE });
+
+  const result = {
+    pass:
+      defaultOff.pass &&
+      sharedTriggerFunction.hotkeySharesTriggerFunction &&
+      toggleOn.pass &&
+      toggleOff.pass &&
+      triggerDelivery.pass &&
+      mutationGate.pass &&
+      presetSwitch.pass &&
+      willQuitUnregistersAll.pass,
+    a_defaultOff: defaultOff,
+    h_sharedTriggerFunction: sharedTriggerFunction,
+    b_toggleOn: toggleOn,
+    b_toggleOff: toggleOff,
+    c_triggerDelivery: triggerDelivery,
+    d_mutationGate: mutationGate,
+    e_f_presetSwitch: presetSwitch,
+    g_willQuitUnregistersAll: willQuitUnregistersAll,
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+  };
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "external-mute-probe-result.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[external-mute-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
 
   state.tray?.destroy();
   state.sourcePickerWindow?.destroy();
@@ -4521,12 +5101,16 @@ async function main() {
   // + テスト/probe モードでない場合だけ呼ばれる (isUpdaterTestMode の定義箇所参照)。
   setupAutoUpdater();
   maybeCheckForUpdates();
+  // 外部ミュート制御 選択肢 A: 本番相当の起動でのみ、永続化された enabled: true を実際の
+  // globalShortcut 登録へ反映する (isExternalMuteHotkeyProductionRun の定義箇所コメント参照)。
+  if (isExternalMuteHotkeyProductionRun) applyExternalMuteHotkeyFromPersistedState();
   if (isSmoke) await runSmoke();
   if (isMemoryProbe) await runMemoryProbe();
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
   if (isTrayProbe) await runTrayProbe();
   if (isM3CloseSpike) await runM3CloseSpikeProbe();
   if (isM3WindowProbe) await runM3WindowProbe();
+  if (isExternalMuteProbe) await runExternalMuteProbe();
 }
 
 function evidenceFileForMode() {
@@ -4535,6 +5119,7 @@ function evidenceFileForMode() {
   if (isTrayProbe) return "tray-probe-result.json";
   if (isM3CloseSpike) return "m3-close-spike-result.json";
   if (isM3WindowProbe) return "m3-window-probe-result.json";
+  if (isExternalMuteProbe) return "external-mute-probe-result.json";
   return "smoke-result.json";
 }
 

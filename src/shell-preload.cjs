@@ -71,6 +71,34 @@ ipcRenderer.on("native:call-view-placement", (_event, placement) => {
   }
 });
 
+// 外部ミュート制御 選択肢 A (design/external-mute-control.md §4.1/§4.4、運用者確定要件
+// 2026-07-12): main.cjs のグローバルホットキー callback / トレイのアクション項目「マイクミュート
+// 切り替え」の click (どちらも同一の triggerExternalMuteToggle() に集約されている、main.cjs 参照)
+// から送られる "native:external-mute-toggle" を onExternalMuteToggle() で登録されたリスナー全員へ
+// 配る。callControlStateListeners/callViewPlacementListeners と全く同じパターン (モジュールスコープで
+// ipcRenderer.on を 1 度だけ登録し、実際の配信先集合だけを claim 済みトランスポートの
+// onExternalMuteToggle() 経由で登録/解除する)。
+//
+// design §4.1 のとおり、この経路は claimWidgetTransport() の claim-once 対象**の中**に置く
+// (window.selfmatrixNative 直下には足さない) -- claim-once はそもそも「通話 1 本につき 1 回」という
+// 通話固有の制約ではなく、「同一オリジンの子フレームから送信 API に到達される経路を塞ぐ」ための
+// セキュリティ境界 (このファイル冒頭の F2b コメント参照) であり、外部ミュート制御もその境界の内側に
+// 置くべき対象。一方で「通話の有無に関わらず常時待ち受けたい」という性質 (design §4.1) は
+// claim-once の「1 回だけ」という制約と矛盾しない -- claim 自体は起動時に 1 度だけ行われ、
+// 以後この listener 集合は通話の開始/終了と無関係に生き続ける (通話中かどうかの判定は cinny 側の
+// NativeCallEmbed/callEmbedAtom の責務であり、shell-preload.cjs はここでも「中身を解釈しない中継役」
+// のまま)。
+const externalMuteToggleListeners = new Set();
+ipcRenderer.on("native:external-mute-toggle", () => {
+  for (const listener of externalMuteToggleListeners) {
+    try {
+      listener();
+    } catch (error) {
+      console.error("[shell-preload] onExternalMuteToggle listener threw: ", error);
+    }
+  }
+});
+
 // F2b (受け入れレビュー修正): この prototype は cinny を同一オリジンの iframe として埋め込んでいる
 // (desktop-shell.html の #cinny-frame)。同一オリジンなので、cinny の iframe コンテンツ内の JS は
 // ブラウザ標準の同一オリジンアクセスとして `window.parent.selfmatrixNative` に触れられる —
@@ -184,6 +212,18 @@ function claimWidgetTransport() {
     // main 側の実体は applyCallViewBoundsFromCinny() (main.cjs の "native:set-call-view-bounds"
     // ハンドラ) — 入力検証・callViewState==="attached" ゲート・同値スキップはすべてそちら側の責務。
     setCallViewBounds: (bounds) => ipcRenderer.send("native:set-call-view-bounds", bounds),
+    // 外部ミュート制御 選択肢 A (design §4.1/§4.4): グローバルホットキー callback / トレイの
+    // アクション項目 click (main.cjs 側で同一関数 triggerExternalMuteToggle() に集約されている) から
+    // 送られる "native:external-mute-toggle" を購読する。onCallControlState()/onCallViewPlacement()
+    // と全く同じパターン (このファイル冒頭の externalMuteToggleListeners に登録、戻り値は
+    // unsubscribe 関数)。通話の有無に関わらず常時待ち受けられる (claim-once の「1 回だけ」という
+    // 制約とは独立、このファイル冒頭のコメント参照)。
+    onExternalMuteToggle: (listener) => {
+      externalMuteToggleListeners.add(listener);
+      return () => {
+        externalMuteToggleListeners.delete(listener);
+      };
+    },
   };
 }
 
