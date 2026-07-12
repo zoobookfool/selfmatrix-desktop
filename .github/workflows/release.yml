@@ -51,18 +51,26 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Set up pnpm via Corepack
+        run: |
+          $corepackBin = Join-Path $env:RUNNER_TEMP "corepack-bin"
+          New-Item -ItemType Directory -Force -Path $corepackBin | Out-Null
+          corepack enable --install-directory $corepackBin
+          $corepackBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Configure element-call script shell
         working-directory: element-call
-        run: corepack pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
+        run: pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
 
       - name: Install and verify element-call
         working-directory: element-call
+        shell: bash
         run: |
-          corepack pnpm install --frozen-lockfile --ignore-pnpmfile
-          corepack pnpm lint
-          corepack pnpm test:unit -- --run
-          corepack pnpm audit --prod
-          corepack pnpm build:embedded
+          pnpm install --frozen-lockfile --ignore-pnpmfile
+          pnpm lint
+          pnpm test:unit -- --run
+          pnpm audit --prod
+          pnpm build:embedded
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
