@@ -1108,6 +1108,10 @@ function createCallWindow(options = {}) {
     });
   } else {
     win.on("close", (event) => {
+      // close=メイン復帰は detached (別窓で表示中) のときだけ発火する。attached/none のときは
+      // 通常のクローズに任せる (closeCallView()/hangup による通話終了経路と競合させないための
+      // 状態機械ガード、design §3-2)。この "!==" を反転すると復帰が壊れることを step5 の
+      // 変異テスト B で実証済み (native-callflow.e2e.mjs runCloseWindowMainRevert)。
       if (state.callViewState !== "detached" || !state.callView) return;
       event.preventDefault();
       attachCallView()
@@ -3363,6 +3367,23 @@ function setupE2EIntrospection() {
     attachCallView: async () => {
       await attachCallView();
       return { ok: true, callViewState: state.callViewState };
+    },
+    // SelfMatrix M3 step 5 (native-callflow.e2e.mjs の runCloseWindowMainRevert() 用、M3 の受け入れ
+    // 条件の核心): 別窓 (state.callWindow) をユーザーが実際に X ボタンで閉じたのと同じ経路 --
+    // `win.destroy()` ではなく `win.close()` をそのまま呼ぶ。createCallWindow() が登録した
+    // "close" ハンドラ (既定の close-preserve モード) がキャンセル可能な "close" イベントを
+    // 実際に受け取り、`event.preventDefault()` → `attachCallView()` (無再接続でメインへ退避) →
+    // 完了後に `win.destroy()` する一連の production 経路をそのまま起動する。detachCallView()/
+    // attachCallView() の直接呼び出しとは異なるコードパス (close ハンドラそのもの) を通る点が
+    // このヘルパーの意味 -- attachCallView() を直接呼ぶだけでは close ハンドラ自体の実装
+    // (event.preventDefault() の有無、callViewState !== "detached" 時のガード等) は検証できない。
+    closeCallWindow: () => {
+      if (!state.callWindow || state.callWindow.isDestroyed()) {
+        return { ok: false, reason: "no_call_window" };
+      }
+      const windowId = state.callWindow.id;
+      state.callWindow.close();
+      return { ok: true, windowId };
     },
     // M2 bounds sync (native-callflow.e2e.mjs の runBoundsSync() 用): mainWindow の content
     // サイズを直接変える。ウィンドウリサイズへの追従 (cinny の ResizeObserver → setPlacement() →

@@ -15,12 +15,24 @@
  *      (toggleScreenshare/toggleSpotlight/toggleEmphasis/toggleReactions/toggleSettings/
  *      setSoundOff/setSoundOn) を実行し、実 in-call DOM への到達と `onCallControlState` push に
  *      よる再同期 (main の中継記録 + cinny 自身の DOM の両方) を確認する。
- *   4. alice が screenshare 中の状態で、通話 view をメインウィンドウ⇔別ウィンドウ間で 3 往復
- *      再親子付けし、無再接続 (新規 RTCPeerConnection ゼロ・接続維持・メディア継続・bob 側無影響)
- *      であることを実測する。3 往復とも、main.cjs の実際の contentView 階層 (`callViewAttachedTo`,
- *      state 文字列とは独立した積極的証拠) が detach 後に "window"、attach 後に "main" へ実際に
- *      遷移したことも確認する (H1、受け入れレビュー修正 -- state だけ書き換えて実体を動かさない
- *      no-op 化回帰の検知)。
+ *   4. alice が screenshare 中の状態で、通話 view をメインウィンドウ⇔別ウィンドウ間で 10 往復
+ *      (SelfMatrix M3 step 5、M3 の受け入れ条件そのもの — design/m3-window-ux.md §4「通話中の窓
+ *      出し入れ 10 往復で切断ゼロ」)、`__selfmatrixE2E.detachCallView()/attachCallView()` の直接
+ *      呼び出しで再親子付けし、無再接続 (新規 RTCPeerConnection ゼロ・接続維持・メディア継続・bob
+ *      側無影響) であることを実測する。10 往復とも、main.cjs の実際の contentView 階層
+ *      (`callViewAttachedTo`, state 文字列とは独立した積極的証拠) が detach 後に "window"、
+ *      attach 後に "main" へ実際に遷移したことも確認する (H1、受け入れレビュー修正 -- state だけ
+ *      書き換えて実体を動かさない no-op 化回帰の検知)。
+ *   4.5 (SelfMatrix M3 step 5) cinny 自身の実 ⧉ ボタン (`call_popout`/`call_popin`) を実クリックし、
+ *      production 配線 (CallControls.tsx の onClick → useNativeCallPopoutToggle() →
+ *      NativeCallEmbed.popout()/popin() → transport → IPC → main.cjs の
+ *      detachCallView()/attachCallView()) をエンドツーエンドで検証する
+ *      (`runRealPopoutPopinClick()`) -- 4. の直接呼び出し経路は cinny 側の TS 層を一切経由しない
+ *      ため、この節がその穴を塞ぐ。
+ *   4.6 (SelfMatrix M3 step 5、M3 の最重要判定) 別窓をユーザーが実際に閉じたとき
+ *      (`__selfmatrixE2E.closeCallWindow()` = `state.callWindow.close()`、win.destroy() ではない
+ *      実 X ボタンと同じ経路) の「メインへの自動復帰・無再接続・通話継続 (dispose 誤発火なし)」を
+ *      実測する (`runCloseWindowMainRevert()`)。
  *   5. cinny (mainWindow) と call view (別 session partition) 間の `matrix-setting-*`
  *      localStorage 契約が分離後も生きるかを実測する (M1 step 3c-2 で発見・修正した契約: 詳細は
  *      README とこのファイル内 `verifyLocalStorageContract()` のコメント参照)。
@@ -71,7 +83,10 @@ const evidenceDir = path.join(nativePrototypeDir, "evidence");
 
 const { log, failFast } = makeLogger("native-callflow-e2e");
 
-const REPARENT_ROUND_TRIPS = 3;
+// SelfMatrix M3 step 5 (M3 の受け入れ条件そのもの、design/m3-window-ux.md §4): 「通話中の窓出し入れ
+// 10 往復で切断ゼロ」を満たすため、M1/M3 step 3 まで使っていた 3 往復から引き上げた。判定ロジック
+// (runWindowMoveReparenting() 側) は不変 -- ラウンド数だけがここで変わる。
+const REPARENT_ROUND_TRIPS = 10;
 const REPARENT_SETTLE_MS = 800;
 
 // ---- call view 内で評価する再利用スクリプト群 ---------------------------------------------
@@ -937,6 +952,221 @@ async function runFooterVisibilityToggle(aliceApp) {
   };
 }
 
+// ---- SelfMatrix M3 step 5 (M3 の受け入れ条件そのもの、design/m3-window-ux.md §4) -------------
+
+// 窓移動の id 集合/生死判定は runWindowMoveReparenting() と同じ考え方 (「新規 RTCPeerConnection
+// ゼロ」は id 集合の完全一致、「既存 PC が connected を維持」は事前に connected だった PC だけを
+// 対象にする) を 2 箇所 (runRealPopoutPopinClick()/runCloseWindowMainRevert()) で使い回すための
+// 共有ヘルパー。
+function pcIdSet(pcs) {
+  return pcs.map((pc) => pc.id).sort().join(",");
+}
+function isPcLive(pc) {
+  return (
+    pc.connectionState === "connected" || pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed"
+  );
+}
+function livePcsStillLive(before, afterById) {
+  return before.length > 0 && before.every((pc) => {
+    const after = afterById.get(pc.id);
+    return after && isPcLive(after);
+  });
+}
+
+// M3 step 5 (2): cinny 自身の実 ⧉ ボタンを実クリックし、production 配線
+// (CallControls.tsx の onClick → useCallEmbed.ts の useNativeCallPopoutToggle() →
+// NativeCallEmbed.popout()/popin() (cinny/src/app/plugins/call/native/NativeCallEmbed.ts) →
+// transport.popoutCallView()/popinCallView() (nativeBridge.ts) → IPC →
+// main.cjs の detachCallView()/attachCallView()) をエンドツーエンドで検証する。
+//
+// runWindowMoveReparenting()/runFooterVisibilityToggle() はどちらも
+// `global.__selfmatrixE2E.detachCallView()/attachCallView()` を main プロセス内から直接呼んでおり、
+// cinny 側の TS 層 (CallControls.tsx の onClick から NativeCallEmbed.popout() までの配線) を
+// 一切経由しない -- その配線が壊れていても上記 2 つの判定は素通りしてしまう。この関数はその穴を
+// 塞ぐ: alicePage 上の実ボタン (`[data-testid="call_popout"]` → 別窓へ移った後は
+// `[data-testid="call_popin"]`、CallControls.tsx の popoutButtonTestId 参照) を実際に
+// Playwright でクリックし、(a) main.cjs 側の実体 (computeCallViewAttachedTo()、H1 と同じ
+// 「state ではなく実体から逆算」方針) が実際に "window"→"main" と遷移すること、(b) その間
+// RTCPeerConnection が 1 つも作り直されず (id 集合不変)、事前に connected だった PC が
+// connected を維持すること (無再接続) の両方を実測する。
+async function runRealPopoutPopinClick(aliceApp, alicePage) {
+  const beforeSnapshot = await getMainProcessSnapshot(aliceApp);
+  const attachedBefore = beforeSnapshot?.callViewAttachedTo ?? null;
+  const pcsBefore = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const liveBefore = pcsBefore.filter(isPcLive);
+
+  // 1. popout: `call_popout` ボタンを実クリック (placement==='main' の間はこの testid、
+  //    CallControls.tsx の popoutButtonTestId 参照)。
+  const popoutButtonVisible = await alicePage
+    .locator('[data-testid="call_popout"]')
+    .waitFor({ state: "visible", timeout: 10000 })
+    .then(() => true)
+    .catch(() => false);
+  if (popoutButtonVisible) {
+    await alicePage.locator('[data-testid="call_popout"]').click();
+  }
+
+  const afterPopout = await waitForCondition(
+    "realPopoutPopinClick.attachedToWindow",
+    async () => {
+      const snap = await getMainProcessSnapshot(aliceApp);
+      return { ok: snap?.callViewAttachedTo === "window", attachedTo: snap?.callViewAttachedTo ?? null };
+    },
+    10000,
+    { log },
+  );
+  const pcsAfterPopout = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const noReconnectAfterPopout = pcIdSet(pcsBefore) === pcIdSet(pcsAfterPopout);
+  const stillConnectedAfterPopout = livePcsStillLive(
+    liveBefore,
+    new Map(pcsAfterPopout.map((pc) => [pc.id, pc])),
+  );
+
+  // 2. popin: 別窓へ移った後は同じボタン位置の testid が `call_popin` に切り替わる
+  //    (nativePopin === true、CallControls.tsx 参照) -- それを実クリックしてメインへ戻す。
+  const popinButtonVisible = await alicePage
+    .locator('[data-testid="call_popin"]')
+    .waitFor({ state: "visible", timeout: 10000 })
+    .then(() => true)
+    .catch(() => false);
+  if (popinButtonVisible) {
+    await alicePage.locator('[data-testid="call_popin"]').click();
+  }
+
+  const afterPopin = await waitForCondition(
+    "realPopoutPopinClick.attachedToMain",
+    async () => {
+      const snap = await getMainProcessSnapshot(aliceApp);
+      return { ok: snap?.callViewAttachedTo === "main", attachedTo: snap?.callViewAttachedTo ?? null };
+    },
+    10000,
+    { log },
+  );
+  const pcsAfterPopin = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const noReconnectAfterPopin = pcIdSet(pcsBefore) === pcIdSet(pcsAfterPopin);
+  const stillConnectedAfterPopin = livePcsStillLive(
+    liveBefore,
+    new Map(pcsAfterPopin.map((pc) => [pc.id, pc])),
+  );
+
+  const pass =
+    attachedBefore === "main" &&
+    popoutButtonVisible &&
+    afterPopout.ok &&
+    noReconnectAfterPopout &&
+    stillConnectedAfterPopout &&
+    popinButtonVisible &&
+    afterPopin.ok &&
+    noReconnectAfterPopin &&
+    stillConnectedAfterPopin;
+
+  return {
+    attachedBefore,
+    popoutButtonVisible,
+    attachedAfterPopout: afterPopout.attachedTo,
+    noReconnectAfterPopout,
+    stillConnectedAfterPopout,
+    popinButtonVisible,
+    attachedAfterPopin: afterPopin.attachedTo,
+    noReconnectAfterPopin,
+    stillConnectedAfterPopin,
+    measurements: { pcsBefore, pcsAfterPopout, pcsAfterPopin },
+    pass,
+  };
+}
+
+// M3 step 5 (3, M3 の受け入れ条件の核心): 別窓をユーザーが実際に閉じたとき
+// (`state.callWindow.close()` -- `win.destroy()` ではない、実際の X ボタンと同じキャンセル可能な
+// "close" イベント経路) の「メインへの自動復帰・無再接続・通話継続」を実測する。
+// main.cjs の createCallWindow() は既定 (close-preserve) で、この "close" イベントを
+// `event.preventDefault()` した上で `attachCallView()` を待ち、完了後に `win.destroy()` する
+// (design/m3-window-ux.md §3-1)。cinny 側は popinCallView() を一度も呼んでいないのに main 側だけで
+// "main" へ勝手に復帰する経路であり、runRealPopoutPopinClick() の実クリック popin とは別の
+// コードパスを通る -- E2E からこれを起こすには「実際に close イベントを発火させる」窓口が
+// main.cjs 側の __selfmatrixE2E に無かったため、このコミットで `closeCallWindow()`
+// (= `state.callWindow.close()` をそのまま呼ぶだけ) を追加した (main.cjs 参照)。
+//
+// 判定の核心 (M3 の最重要判定): `callViewState !== "none"` -- closeCallView()/hangup が
+// (close ハンドラの実装ミス等で) 誤発火していないこと。誤発火すれば isCallActive() の定義
+// (main.cjs 参照) どおり "none" に落ちるため、確実に検知できる。
+async function runCloseWindowMainRevert(aliceApp, bobApp) {
+  const callViewStateBefore = (await getMainProcessSnapshot(aliceApp))?.callViewState ?? null;
+
+  // 1. popout: 別窓へ (ここで検証したいのは close=復帰の状態機械であって popout 自体の配線では
+  //    ないため、windowMoveReparenting()/footerVisibilityToggle() と同じ直接呼び出しで移す)。
+  await aliceApp.evaluate(() => global.__selfmatrixE2E.detachCallView());
+  await wait(REPARENT_SETTLE_MS);
+  const attachedAfterPopout = (await getMainProcessSnapshot(aliceApp))?.callViewAttachedTo ?? null;
+
+  const pcsBeforeClose = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const liveBeforeClose = pcsBeforeClose.filter(isPcLive);
+  const bobPcsBeforeClose = (await evalInCallView(bobApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const bobLiveBeforeClose = bobPcsBeforeClose.filter(isPcLive);
+  const bobInCallBeforeClose = await evalInCallView(
+    bobApp,
+    `document.querySelector('[data-testid="incall_leave"]') !== null`,
+  );
+
+  // 2. 実クローズ: state.callWindow.close() をそのまま呼ぶ E2E 専用窓口。
+  const closeResult = await aliceApp.evaluate(() => global.__selfmatrixE2E.closeCallWindow());
+
+  const revertedToMain = await waitForCondition(
+    "closeWindowMainRevert.attachedToMain",
+    async () => {
+      const snap = await getMainProcessSnapshot(aliceApp);
+      return { ok: snap?.callViewAttachedTo === "main", snapshot: snap };
+    },
+    10000,
+    { log },
+  );
+  const afterCloseSnapshot = revertedToMain.snapshot ?? (await getMainProcessSnapshot(aliceApp));
+  const attachedAfterClose = afterCloseSnapshot?.callViewAttachedTo ?? null;
+  const callViewStateAfterClose = afterCloseSnapshot?.callViewState ?? null;
+
+  await wait(500); // PC/DOM が落ち着く猶予 (windowMoveReparenting() の afterラウンド待ちと同水準)。
+
+  const pcsAfterClose = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const noReconnect = pcIdSet(pcsBeforeClose) === pcIdSet(pcsAfterClose);
+  const pcStable = noReconnect && livePcsStillLive(liveBeforeClose, new Map(pcsAfterClose.map((pc) => [pc.id, pc])));
+
+  // dispose 誤発火検知 (M3 の最重要判定、上のコメント参照)。
+  const callDidNotEnd = callViewStateAfterClose !== "none";
+
+  const bobPcsAfterClose = (await evalInCallView(bobApp, PCS_SUMMARY_SCRIPT)).value ?? [];
+  const bobInCallAfterClose = await evalInCallView(
+    bobApp,
+    `document.querySelector('[data-testid="incall_leave"]') !== null`,
+  );
+  const bobUnaffected =
+    Boolean(bobInCallBeforeClose.ok && bobInCallBeforeClose.value === true) &&
+    Boolean(bobInCallAfterClose.ok && bobInCallAfterClose.value === true) &&
+    livePcsStillLive(bobLiveBeforeClose, new Map(bobPcsAfterClose.map((pc) => [pc.id, pc])));
+
+  const pass =
+    attachedAfterPopout === "window" &&
+    Boolean(closeResult && closeResult.ok) &&
+    revertedToMain.ok &&
+    attachedAfterClose === "main" &&
+    noReconnect &&
+    pcStable &&
+    callDidNotEnd &&
+    bobUnaffected;
+
+  return {
+    callViewStateBefore,
+    attachedAfterPopout,
+    closeResult,
+    attachedAfterClose,
+    callViewStateAfterClose,
+    callDidNotEnd,
+    noReconnect,
+    pcStable,
+    bobUnaffected,
+    measurements: { pcsBeforeClose, pcsAfterClose, bobPcsBeforeClose, bobPcsAfterClose },
+    pass,
+  };
+}
+
 // M1 step 3c-2 (localStorage 契約の実機確認): cinny (mainWindow) と call view は session
 // partition が異なるため (src/main.cjs の CALL_VIEW_PARTITION)、web 版で
 // 成立していた「cinny が書く matrix-setting-* を EC が読む」契約 (screenShareSettings.ts /
@@ -1575,6 +1805,41 @@ async function main() {
         `pass=${footerVisibilityToggle.pass}`,
     );
 
+    // ---- 8.6 SelfMatrix M3 step 5 (M3 の受け入れ条件そのもの): cinny 自身の実 ⧉ ボタンを実クリック
+    //          しての popout/popin (production 配線検証)。footerVisibilityToggle 直後 (call view は
+    //          "main" に attached で終わる) に行う。---------------------------------------------
+    const realPopoutPopinClick = await runRealPopoutPopinClick(aliceApp, alicePage);
+    result.passConditions.realPopoutPopinClick = realPopoutPopinClick;
+    log(
+      `realPopoutPopinClick: attachedBefore=${realPopoutPopinClick.attachedBefore} ` +
+        `popoutButtonVisible=${realPopoutPopinClick.popoutButtonVisible} ` +
+        `attachedAfterPopout=${realPopoutPopinClick.attachedAfterPopout} ` +
+        `noReconnectAfterPopout=${realPopoutPopinClick.noReconnectAfterPopout} ` +
+        `stillConnectedAfterPopout=${realPopoutPopinClick.stillConnectedAfterPopout} ` +
+        `popinButtonVisible=${realPopoutPopinClick.popinButtonVisible} ` +
+        `attachedAfterPopin=${realPopoutPopinClick.attachedAfterPopin} ` +
+        `noReconnectAfterPopin=${realPopoutPopinClick.noReconnectAfterPopin} ` +
+        `stillConnectedAfterPopin=${realPopoutPopinClick.stillConnectedAfterPopin} ` +
+        `pass=${realPopoutPopinClick.pass}`,
+    );
+
+    // ---- 8.7 SelfMatrix M3 step 5 (M3 の受け入れ条件の核心): 別窓を実際に閉じたときのメイン復帰・
+    //          通話継続 (dispose 誤発火なし)。realPopoutPopinClick 直後 (call view は "main" に
+    //          attached で終わる) に行う。-----------------------------------------------------
+    const closeWindowMainRevert = await runCloseWindowMainRevert(aliceApp, bobApp);
+    result.passConditions.closeWindowMainRevert = closeWindowMainRevert;
+    log(
+      `closeWindowMainRevert: attachedAfterPopout=${closeWindowMainRevert.attachedAfterPopout} ` +
+        `closeResult.ok=${closeWindowMainRevert.closeResult?.ok} ` +
+        `attachedAfterClose=${closeWindowMainRevert.attachedAfterClose} ` +
+        `callViewStateAfterClose=${closeWindowMainRevert.callViewStateAfterClose} ` +
+        `callDidNotEnd=${closeWindowMainRevert.callDidNotEnd} ` +
+        `noReconnect=${closeWindowMainRevert.noReconnect} ` +
+        `pcStable=${closeWindowMainRevert.pcStable} ` +
+        `bobUnaffected=${closeWindowMainRevert.bobUnaffected} ` +
+        `pass=${closeWindowMainRevert.pass}`,
+    );
+
     // ---- 9. 証跡スクリーンショット (2 ユーザー + 配信 + 窓移動の「本来の」通話状態を、次の
     //         callRespawn ステップで alice が退出する前に残しておく) ---------------------------
     const finalSnapshot = await getMainProcessSnapshot(aliceApp);
@@ -1633,6 +1898,8 @@ async function main() {
       result.passConditions.bobWatchOptIn.ok &&
       result.passConditions.windowMoveReparenting.pass &&
       result.passConditions.footerVisibilityToggle.pass &&
+      result.passConditions.realPopoutPopinClick.pass &&
+      result.passConditions.closeWindowMainRevert.pass &&
       result.passConditions.callRespawn.pass;
   } catch (error) {
     result.error = String(error && error.message ? error.message : error);
