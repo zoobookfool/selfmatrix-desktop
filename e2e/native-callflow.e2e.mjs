@@ -829,6 +829,114 @@ async function runWindowMoveReparenting(aliceApp, bobApp) {
   };
 }
 
+// M3 step 3 (design/m3-window-ux.md §3-3, desktop 実装は call-control-preload.cjs の
+// applyFooterVisibility()/main.cjs の pushCallViewFooterVisibility()): EC フッターの出し分け
+// (別窓=表示 / メイン埋め込み=非表示) を実 in-call UI で検証する。
+//
+// 「popoutCallView()/popinCallView() で駆動する」という設計文書の記述に対し、この E2E は
+// windowMoveReparenting/boundsSync/callRespawn と同じ既存パターンに揃えて
+// `global.__selfmatrixE2E.detachCallView()/attachCallView()` (main プロセス内部の
+// detachCallView()/attachCallView() を直接呼ぶ E2E 専用窓口) を使う -- cinny 側にはまだ
+// popout 導線 UI が無い (design §2 のサブステップ 4、このタスクの範囲外) ため、cinny 自身の
+// ⧉ ボタンをクリックする経路が存在しない。ただし main.cjs の
+// `ipcMain.handle("native:popout-call-view", () => detachCallView())` /
+// `ipcMain.handle("native:popin-call-view", () => attachCallView())` は options 無しで
+// detachCallView()/attachCallView() を呼ぶだけなので、ここで直接呼ぶのと**完全に同じコードパス**
+// (フッター push を含む) が実行される。
+//
+// 判定は「メイン埋め込み時は visibility:hidden」「別窓時は visibility:visible かつ実際に画面上に
+// 大きさを持つ (getBoundingClientRect)」の両方を、attach 前後で AND を取る -- computeCallViewAttachedTo()
+// (H1 と同じ「state 文字列ではなく実体」方針) と組み合わせて、「実際に窓が動いていないのに
+// フッターだけ表示に切り替わった」ような食い違いも検知できるようにしてある。
+const FOOTER_VISIBILITY_SCRIPT = `(() => {
+  const leave = document.querySelector('[data-testid="incall_leave"]');
+  const controls = leave && leave.parentElement ? leave.parentElement.parentElement : null;
+  if (!controls) return { found: false };
+  const style = window.getComputedStyle(controls);
+  const rect = controls.getBoundingClientRect();
+  return {
+    found: true,
+    visibility: style.visibility,
+    position: style.position,
+    rectHasSize: rect.width > 0 && rect.height > 0,
+  };
+})()`;
+
+async function readFooterState(aliceApp) {
+  return evalInCallView(aliceApp, FOOTER_VISIBILITY_SCRIPT);
+}
+
+function footerHiddenAsExpected(readResult) {
+  return Boolean(
+    readResult && readResult.ok && readResult.value && readResult.value.found && readResult.value.visibility === "hidden",
+  );
+}
+
+function footerVisibleAsExpected(readResult) {
+  return Boolean(
+    readResult &&
+      readResult.ok &&
+      readResult.value &&
+      readResult.value.found &&
+      readResult.value.visibility === "visible" &&
+      readResult.value.rectHasSize === true,
+  );
+}
+
+async function runFooterVisibilityToggle(aliceApp) {
+  const beforeSnapshot = await getMainProcessSnapshot(aliceApp);
+  const attachedBefore = beforeSnapshot?.callViewAttachedTo ?? null;
+  const footerAttached = await readFooterState(aliceApp);
+
+  // popoutCallView() 相当 (see comment above -- same main.cjs code path).
+  const detach = await aliceApp.evaluate(() => global.__selfmatrixE2E.detachCallView());
+  const footerAfterDetach = await waitForCondition(
+    "footerVisibilityToggle.visibleAfterDetach",
+    async () => {
+      const read = await readFooterState(aliceApp);
+      return { ok: footerVisibleAsExpected(read), read };
+    },
+    10000,
+    { log },
+  );
+  const afterDetachSnapshot = await getMainProcessSnapshot(aliceApp);
+  const attachedAfterDetach = afterDetachSnapshot?.callViewAttachedTo ?? null;
+
+  // popinCallView() 相当 (see comment above -- same main.cjs code path).
+  const attach = await aliceApp.evaluate(() => global.__selfmatrixE2E.attachCallView());
+  const footerAfterAttach = await waitForCondition(
+    "footerVisibilityToggle.hiddenAfterAttach",
+    async () => {
+      const read = await readFooterState(aliceApp);
+      return { ok: footerHiddenAsExpected(read), read };
+    },
+    10000,
+    { log },
+  );
+  const afterAttachSnapshot = await getMainProcessSnapshot(aliceApp);
+  const attachedAfterAttach = afterAttachSnapshot?.callViewAttachedTo ?? null;
+
+  const pass =
+    attachedBefore === "main" &&
+    footerHiddenAsExpected(footerAttached) &&
+    attachedAfterDetach === "window" &&
+    footerAfterDetach.ok &&
+    attachedAfterAttach === "main" &&
+    footerAfterAttach.ok;
+
+  return {
+    attachedBefore,
+    footerWhileAttachedBefore: footerAttached,
+    detach,
+    attachedAfterDetach,
+    footerWhileDetached: footerAfterDetach.read,
+    attach,
+    attachedAfterAttach,
+    footerWhileAttachedAfter: footerAfterAttach.read,
+    pass,
+  };
+}
+
 // M1 step 3c-2 (localStorage 契約の実機確認): cinny (mainWindow) と call view は session
 // partition が異なるため (src/main.cjs の CALL_VIEW_PARTITION)、web 版で
 // 成立していた「cinny が書く matrix-setting-* を EC が読む」契約 (screenShareSettings.ts /
@@ -1452,6 +1560,21 @@ async function main() {
         `allRoundTripsActuallyMoved=${windowMove.allRoundTripsActuallyMoved}`,
     );
 
+    // ---- 8.5. M3 step 3: EC フッターの出し分け (別窓=表示 / メイン埋め込み=非表示) を実 in-call
+    //           UI に対して検証する。windowMoveReparenting の直後 (call view は "main" に attached
+    //           で終わる) に行う。--------------------------------------------------------------
+    const footerVisibilityToggle = await runFooterVisibilityToggle(aliceApp);
+    result.passConditions.footerVisibilityToggle = footerVisibilityToggle;
+    log(
+      `footerVisibilityToggle: attachedBefore=${footerVisibilityToggle.attachedBefore} ` +
+        `hiddenBefore=${footerHiddenAsExpected(footerVisibilityToggle.footerWhileAttachedBefore)} ` +
+        `attachedAfterDetach=${footerVisibilityToggle.attachedAfterDetach} ` +
+        `visibleWhileDetached=${footerVisibleAsExpected(footerVisibilityToggle.footerWhileDetached)} ` +
+        `attachedAfterAttach=${footerVisibilityToggle.attachedAfterAttach} ` +
+        `hiddenAfterReattach=${footerHiddenAsExpected(footerVisibilityToggle.footerWhileAttachedAfter)} ` +
+        `pass=${footerVisibilityToggle.pass}`,
+    );
+
     // ---- 9. 証跡スクリーンショット (2 ユーザー + 配信 + 窓移動の「本来の」通話状態を、次の
     //         callRespawn ステップで alice が退出する前に残しておく) ---------------------------
     const finalSnapshot = await getMainProcessSnapshot(aliceApp);
@@ -1509,6 +1632,7 @@ async function main() {
       result.passConditions.midCallSettingsSync.pass &&
       result.passConditions.bobWatchOptIn.ok &&
       result.passConditions.windowMoveReparenting.pass &&
+      result.passConditions.footerVisibilityToggle.pass &&
       result.passConditions.callRespawn.pass;
   } catch (error) {
     result.error = String(error && error.message ? error.message : error);

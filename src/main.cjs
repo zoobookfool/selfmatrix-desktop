@@ -303,7 +303,17 @@ const trayEnabled = isTrayProbe || !isTestRunnerMode;
 // の使い捨てディレクトリへ差し替える。app.setPath() は app.whenReady() より前 (このモジュールの
 // 同期評価時点) に呼ぶ必要があるため、ここ (isTestRunnerMode 定義直後、どの run*() 関数よりも前)
 // で行う。
-if (app && isTestRunnerMode) {
+//
+// **重要 (2 インスタンス衝突の回避)**: E2E ハーネス (native-join/native-callflow) は各 Electron
+// インスタンスに `--user-data-dir=<mkdtemp>` を渡して userData を per-instance に隔離している。
+// この固定パスへの setPath はその per-instance 隔離を上書きしてしまい、alice/bob 2 インスタンスが
+// 同じ userData を共有 → 2 個目 (bob) の rust-crypto の IndexedDB/leveldb が 1 個目にロックされて
+// cinny が「起動中です」で無限にストールする (実測で確認)。したがって `--user-data-dir` が既に
+// 指定されている場合 (= E2E) はここで上書きしない — Electron がその dir を userData として使い、
+// 実プロファイルからもインスタンス間からも隔離される。probe 系 (--user-data-dir なし) のときだけ
+// evidence/.test-userdata へ隔離して実プロファイル汚染を防ぐ (probe は単一インスタンスなので衝突なし)。
+const hasExplicitUserDataDir = process.argv.some((a) => a.startsWith("--user-data-dir"));
+if (app && isTestRunnerMode && !hasExplicitUserDataDir) {
   app.setPath("userData", path.join(evidenceDir, ".test-userdata"));
 }
 
@@ -1019,6 +1029,19 @@ function pushCallViewPlacement() {
   }
 }
 
+// M3 step 3 (design/m3-window-ux.md §3-3): EC フッターの出し分け (別窓=表示 / メイン埋め込み=
+// 非表示、Discord 準拠)。pushCallViewPlacement() (mainWindow/cinny 宛て) とは受け手が異なる別
+// チャンネル -- こちらは call view (EC) 自身の call-control-preload.cjs 宛て
+// (native:set-footer-visible、call-control-preload.cjs 冒頭のフッター節参照)。call view が
+// 無い/破棄済みなら何もしない (次に openCallView() が新しい call view を作った際は
+// call-control-preload.cjs 側の既定値 (footerVisible=false=hidden) が「常に attached から
+// 始まる」invariant と一致しているため、push を取りこぼしても見え方は食い違わない)。
+function pushCallViewFooterVisibility() {
+  if (!state.callView || state.callView.webContents.isDestroyed()) return;
+  const visible = state.callViewState === "detached";
+  state.callView.webContents.send("native:set-footer-visible", visible);
+}
+
 // M3 step 0 スパイク (design/m3-window-ux.md §3-1): 別窓を**ユーザーが実際に閉じた**ときの挙動。
 // `options.closeMode` で 2 方式を切り替えられる (runM3CloseSpikeProbe() が両方を実測して比較する
 // ためだけの引数 -- 本番の唯一の呼び出し元 detachCallView() は常に省略、既定の "close-preserve" を
@@ -1512,6 +1535,14 @@ async function openCallView(url, localStorageSnapshot) {
 
   createCallViewIfNeeded();
   await state.callView.webContents.loadURL(url);
+  // M3 step 3 (design §3 step 3 実装要件 2「openCallView 直後 (通話開始 = attached) は非表示で
+  // 初期化」): createCallViewIfNeeded() は call view を必ずまず mainWindow へ addChildView() する
+  // (常に attached から始まる) ので、ロード完了後に明示的に push しておく。loadURL() の resolve を
+  // 待ってから送る -- call-control-preload.cjs の ipcRenderer.on("native:set-footer-visible", ...)
+  // 登録 (トップレベル、preload 実行時) は loadURL() 解決より確実に前に完了しているため、この push
+  // は確実に受信される (push 前の一瞬でも既定値 footerVisible=false と一致するため、万一取りこぼしても
+  // 見え方は食い違わない)。
+  pushCallViewFooterVisibility();
 }
 
 // H3 (受け入れレビュー修正、major): 「共有開始時に再同期」する live localStorage 契約。
@@ -1725,6 +1756,8 @@ async function detachCallView(options = {}) {
     // 直接呼び出し経由でも、この関数を通る限り必ず push する — 呼び出し元を区別しない (design §3-5
     // のとおり cinny 側は「実際にどこへ動いたか」だけを知る必要がある)。
     pushCallViewPlacement();
+    // M3 step 3: 別窓へ移った (detached) ので EC 自身のフッターを表示に切り替える。
+    pushCallViewFooterVisibility();
   }
 }
 
@@ -1735,10 +1768,23 @@ async function attachCallView() {
     state.mainWindow.contentView.addChildView(state.callView);
     state.callViewState = "attached";
     updateCallViewBounds();
+    // M3 (別窓から戻った時の bounds 復帰、design §3-5): detached 中は callView を別窓の全面
+    // ({0,0,w,h}) にしているため、メインへ戻した直後は callView がその全面 bounds のまま残る。
+    // cinny-shell モードの updateCallViewBounds() は attached 時 no-op (bounds は cinny の
+    // setCallViewBounds push が駆動) だが、戻った瞬間は cinny のレイアウトが変化していないため
+    // 再 push が走らない。最後に cinny から受け取ったレイアウト bounds をここで再適用して、
+    // メインのレイアウト位置/サイズへ確実に復帰させる (未受信なら何もしない)。
+    if (state.callViewBoundsFromCinny !== undefined) {
+      applyCallViewBoundsFromCinny(state.callViewBoundsFromCinny);
+    }
     // M3 step 1 (placement push): createCallWindow() の close=復帰ハンドラもこの関数を呼ぶだけなので、
     // ユーザーが別窓を X ボタンで閉じた場合の「勝手な attach」もここから自動的に push される
     // (design §3-5 の核心 — cinny 側は明示的に何も呼んでいないのに main 側で状態が変わるケース)。
     pushCallViewPlacement();
+    // M3 step 3: メインへ戻った (attached) ので EC 自身のフッターを非表示に切り替える (cinny 側
+    // バーで操作する通常状態に戻す)。close=復帰 (createCallWindow() の "close" ハンドラ) 経由でも
+    // この関数を通るため、ユーザーが別窓を X ボタンで閉じた場合も自動的にフッターが隠れる。
+    pushCallViewFooterVisibility();
   }
 }
 

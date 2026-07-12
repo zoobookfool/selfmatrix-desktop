@@ -102,6 +102,16 @@ ipcRenderer.on("native:prime-localstorage", (_event, snapshot) => {
   writeLocalStorageSnapshot(snapshot, "live-update");
 });
 
+// M3 step 3 (design/m3-window-ux.md §3-3): main → call view のフッター可視性 push。
+// pushCallViewPlacement() (native:call-view-placement、main.cjs) とは受け手が異なる別チャンネル --
+// あちらは mainWindow (cinny) 宛て、こちらは call view (この preload) 自身が受信する。main.cjs の
+// detachCallView()/attachCallView()/openCallView() が placement 変化のたびに送る
+// (pushCallViewFooterVisibility() 参照)。footerVisible/applyFooterVisibility() は下で定義。
+ipcRenderer.on("native:set-footer-visible", (_event, visible) => {
+  footerVisible = Boolean(visible);
+  applyFooterVisibility();
+});
+
 const TARGET_SELECTOR = '[role="button"][data-kind="primary"]';
 
 // CallControl.ts (src/app/plugins/call/CallControl.ts) と同一のセレクタ文字列。
@@ -208,6 +218,47 @@ function emphasisButton() {
 
 function settingsButton() {
   return document.querySelector(SETTINGS_LEFT_SELECTOR) || document.querySelector(SETTINGS_CENTER_SELECTOR);
+}
+
+// --- M3 step 3 (design/m3-window-ux.md §3-3): EC フッターの出し分け (別窓=表示 / メイン埋め込み=
+// 非表示) --------------------------------------------------------------------------------------
+//
+// web 版 CallControl.ts (cinny/src/app/plugins/call/CallControl.ts の onBodyMutation()) と
+// 完全に同じ DOM 辿り方でフッター (CallFooter.tsx が描画する grid コンテナ) を特定する:
+// `leaveButton().parentElement.parentElement`。leaveButton = "incall_leave" ボタン (BUTTON) →
+// .parentElement = CallFooter.module.css の .buttons (ボタン群のラッパ) →
+// .parentElement.parentElement = .footer 自体。
+function footerElement() {
+  const leave = leaveButton();
+  return leave && leave.parentElement ? leave.parentElement.parentElement : null;
+}
+
+// main から push される「今フッターを見せるべきか」(design §3-3: attached (メイン埋め込み)=false/
+// hidden, detached (別窓)=true/visible)。既定は false -- 新規に作られる call view は
+// createCallViewIfNeeded() が必ずまず mainWindow へ addChildView() する (常に attached から始まる)
+// ため、この既定値は「push がまだ届いていない最初の一瞬」でも実際の attached 状態と食い違わない。
+// フッター自体が実 DOM に現れるのは通話参加後しばらく経ってから (LiveKit 接続後) なので、
+// localStorage 契約 (primeLocalStorageFromShell()) のような sendSync 版の pending 値取得は不要
+// -- top-level で登録済みの ipcRenderer.on("native:set-footer-visible", ...) が確実にその出現より
+// 先に (少なくとも同じくらい早く) 届く。
+let footerVisible = false;
+
+// 元実装: CallControl.ts の onBodyMutation() のフッター部分。hidden 時は web 版と同一の
+// position:absolute + visibility:hidden (隠れている間はレイアウト上の場所を取らない)。visible 時は
+// どちらのインライン override も外し、CallFooter.module.css の既定 (position:sticky、可視) に
+// そのまま任せる -- 別窓では EC 自身の通常レイアウトで見えてほしいため、web 版のように無条件で
+// position:absolute を強制することはしない (web 版はメイン埋め込み専用でフッターを見せる状態が
+// 無いため、position:absolute を外す分岐自体が存在しない)。
+function applyFooterVisibility() {
+  const controls = footerElement();
+  if (!controls) return;
+  if (footerVisible) {
+    controls.style.removeProperty("position");
+    controls.style.removeProperty("visibility");
+  } else {
+    controls.style.setProperty("position", "absolute");
+    controls.style.setProperty("visibility", "hidden");
+  }
 }
 
 // CallControl.ts の onControlMutation() と同じ計算: screenshare は data-kind 属性、
@@ -330,10 +381,17 @@ function ensureBodyObserver() {
   if (bodyMutationObserver) return;
   if (!document.body) return;
   bodyMutationObserver = new MutationObserver(() => {
+    // M3 step 3: フッター可視性は screenshare/spotlight/emphasis (controlElementsChanged() の
+    // 追跡対象) とは独立に、body mutation のたびに無条件で再適用する -- フッター自身の DOM ノードが
+    // 再マウント (differs from the 3 tracked control elements) で差し替わっても、直近の
+    // footerVisible を確実に再適用するため (controlElementsChanged() のガードに相乗りすると、
+    // 3 要素は変わらずフッターだけ差し替わったケースを取りこぼす)。
+    applyFooterVisibility();
     if (controlElementsChanged()) observeCallControls();
   });
   bodyMutationObserver.observe(document.body, { childList: true, subtree: true });
   observeCallControls();
+  applyFooterVisibility();
 }
 
 function clickAndReport(target, action) {
@@ -451,6 +509,24 @@ function invoke(action) {
       return { ok: false, reason: "unknown_action", action };
   }
 }
+
+// M3 step 3 (design §3-3 実装要件「初期化タイミング」): フッター出し分けは通話開始直後 (最初の
+// コントロールクリックより前) から要る。ensureBodyObserver() はこれまで toggleScreenshare 等の
+// invoke() 初回呼び出し時にしか起動されておらず (上の switch 文の各 case 参照)、それだと「ユーザーが
+// 最初に何かクリックするまでフッターが (本来隠れているべきなのに) 一瞬見えてしまう」ちらつきが
+// 起き得る。DOMContentLoaded (Electron の dom-ready 相当 -- 初期 HTML パース完了直後、EC の
+// React バンドルが実行され始める前後のタイミング) で確実に一度 ensureBodyObserver() を起動して
+// おく。document が無い環境 (このファイルを Node 単体で require するテストハーネス等) では
+// typeof チェックで安全に何もしない -- ファイル冒頭コメントの方針 (DOM グローバル参照は関数本体の
+// 中に限定) を維持する。
+(function scheduleEnsureBodyObserver() {
+  if (typeof document === "undefined") return;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => ensureBodyObserver(), { once: true });
+  } else {
+    ensureBodyObserver();
+  }
+})();
 
 // RPC: main.cjs の ipcMain.handle("native:call-control:invoke") が correlationId 付きで
 // webContents.send してくるリクエストに応答する。main は action の意味を解釈しない中継役に

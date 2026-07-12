@@ -221,9 +221,16 @@ export async function dismissBlockingModals(page, { log }) {
 // クリックが安定しないことがあった -- そのケースでは本ヘルパーを使わず、join ボタンだけを
 // 直接待ってクリックすること (runCallRespawn() 参照)。
 export async function openVoiceLoungeAndJoin(page, { log }, roomName = ROOM_NAME) {
+  // 既存部屋の検出は寛容に待つ (60s): 2 個目の Electron インスタンス (bob) はログイン直後に
+  // ここへ来るうえ、alice のインスタンス + 実通話が CPU を消費している中で初回同期 +
+  // rust-crypto 初期化 + サイドバー描画をするため、単独なら ~18s で見える部屋が競合下では
+  // 30s を超えることがある (実測)。dev ユーザー (alice/bob) はどちらも Voice Lounge の正規
+  // メンバーなので部屋は必ず存在する — 短いタイムアウトで諦めて作成フォールバックに落ちると、
+  // 実際にはメンバーなのに壊れた作成 UI を踏んで失敗する。visible になれば即 return するので
+  // 余分な待ちは発生しない。
   const existingRoom = page.getByText(roomName, { exact: true }).first();
   const alreadyExists = await existingRoom
-    .waitFor({ state: "visible", timeout: 6000 })
+    .waitFor({ state: "visible", timeout: 60000 })
     .then(() => true)
     .catch(() => false);
 
