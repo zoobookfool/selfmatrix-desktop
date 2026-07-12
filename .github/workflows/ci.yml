@@ -19,7 +19,6 @@ jobs:
     timeout-minutes: 45
     env:
       NODE_VERSION: "24"
-      PNPM_VERSION: "10.33.0"
 
     steps:
       - name: Checkout selfmatrix-desktop
@@ -57,25 +56,18 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
       - name: Configure element-call script shell
         working-directory: element-call
-        shell: bash
-        run: pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
+        run: corepack pnpm config set scriptShell "C:\\Program Files\\Git\\bin\\bash.exe"
 
       - name: Verify element-call
         working-directory: element-call
-        shell: bash
         run: |
-          pnpm install --frozen-lockfile --ignore-pnpmfile
-          pnpm lint
-          pnpm test:unit -- --run
-          pnpm audit --prod
-          pnpm build:embedded
+          corepack pnpm install --frozen-lockfile --ignore-pnpmfile
+          corepack pnpm lint
+          corepack pnpm test:unit -- --run
+          corepack pnpm audit --prod
+          corepack pnpm build:embedded
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
