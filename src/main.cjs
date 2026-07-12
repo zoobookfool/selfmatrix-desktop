@@ -8,6 +8,7 @@ const {
   app,
   BrowserWindow,
   WebContentsView,
+  clipboard,
   desktopCapturer,
   globalShortcut,
   ipcMain,
@@ -20,6 +21,11 @@ const {
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+// 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2): ローカル制御 API のトークン生成
+// (crypto.randomBytes) とトークン照合 (crypto.timingSafeEqual) に使う。--minisign-probe は同じ
+// node:crypto を関数内 require で個別に取得している (署名検証専用の隔離された使い方) が、こちらは
+// 常駐 HTTP サーバーの認証パスから高頻度に呼ばれるためモジュール冒頭で通常の require にしてある。
+const crypto = require("node:crypto");
 
 // Electron 非依存の Widget API bridge 純関数群は widget-bridge-protocol.cjs に集約されている。
 // main.cjs はこれらを自前で再実装せず、常にこのモジュールへ委譲する
@@ -292,6 +298,15 @@ if (isM3WindowProbe) {
 // 直接呼んで機械的に検証する) を踏襲する。runExternalMuteProbe() 参照。
 const isExternalMuteProbe = process.argv.includes("--external-mute-probe");
 
+// 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2、運用者確定要件 2026-07-12
+// 「A と B の両方を実装する」): localhost 制御 API (Node 組み込み http、127.0.0.1 のみ bind) の
+// 検証専用モード。Stream Deck プラグインや自作スクリプトからの実接続は自動化しにくいため、
+// isExternalMuteProbe と同じ方針で、この専用モードから実際に 127.0.0.1:<port> へ HTTP リクエストを
+// 送って機械的に検証する (runExternalApiProbe() 参照)。選択肢 A と B は「引き金の生成元」だけが違い、
+// triggerExternalMuteToggle() 以降の配送経路 (IPC → shell-preload.cjs → cinny) を完全に共有する
+// (design §4.4) ため、cinny 側の変更は一切不要。
+const isExternalApiProbe = process.argv.includes("--external-api-probe");
+
 // M2 トレイ常駐 (運用者確定仕様: 閉じるボタン = トレイに最小化、終了はトレイメニューから):
 // 有効なのは「本番起動」(フラグ無し既定、または `--cinny-shell` 明示) のときだけ。
 // smoke/memory-probe/cinny-shell-smoke はどれも自分の run*() の末尾で app.exit() を呼んで
@@ -310,6 +325,8 @@ const isExternalMuteProbe = process.argv.includes("--external-mute-probe");
 // コメント参照)。決定的な検証のため実プロファイルの永続化ファイルに一切触れずに済ませたい —
 // evidence/.test-userdata (.gitignore 済み) へ隔離することで、開発者の実ホットキー設定を読んでテスト
 // 実行のたびに本物の OS グローバルホットキーを誤って登録する事故を防ぐ。
+// 選択肢 B (--external-api-probe) も同じ理由で加える: 開発者の実 userData に外部制御 API のトークンが
+// 生成されたり、テスト実行のたびに本物の 127.0.0.1 待受ポートが開いてしまう事故を防ぐ。
 const isTestRunnerMode =
   isSmoke ||
   isMemoryProbe ||
@@ -318,7 +335,8 @@ const isTestRunnerMode =
   isHarness ||
   isM3CloseSpike ||
   isM3WindowProbe ||
-  isExternalMuteProbe;
+  isExternalMuteProbe ||
+  isExternalApiProbe;
 const trayEnabled = isTrayProbe || !isTestRunnerMode;
 
 // グローバルホットキーの起動時自動適用 (applyExternalMuteHotkeyFromPersistedState()) は本番相当の
@@ -327,6 +345,12 @@ const trayEnabled = isTrayProbe || !isTestRunnerMode;
 // しまわないよう明示的に除外する。--external-mute-probe 自身は決定的な検証のため呼び出しタイミングを
 // runExternalMuteProbe() 側で自分で管理する (main() からは自動的に呼ばない)。
 const isExternalMuteHotkeyProductionRun = !isTestRunnerMode && !isTrayProbe;
+
+// 選択肢 B: ローカル制御 API サーバーの起動時自動適用 (applyExternalApiFromPersistedState()) の
+// 本番相当ゲート。isExternalMuteHotkeyProductionRun と全く同じ理由・同じ条件式 (tray-probe は実
+// userData を読むが本物の待受ポートを勝手に開かせたくない、--external-api-probe 自身は
+// runExternalApiProbe() 側で呼び出しタイミングを自己管理する)。
+const isExternalApiProductionRun = !isTestRunnerMode && !isTrayProbe;
 
 // M3 step 2 (窓サイズ/位置記憶): app.getPath("userData") は既定でこの OS ユーザーの実プロファイル
 // ディレクトリ (例 Windows の %APPDATA%/SelfMatrix) を指す。callWindow の bounds 永続化
@@ -364,6 +388,18 @@ if (app && isExternalMuteProbe) {
   } catch (error) {
     // 初回実行 (ファイルがまだ存在しない) は正常系。それ以外の失敗もベストエフォートで無視する
     // (この後の runExternalMuteProbe() 側の各アサーションが不整合を検知する)。
+  }
+}
+
+// 選択肢 B (--external-api-probe) 専用: 上と全く同じ理由で、前回実行が残したトークン/有効化状態
+// (external-mute-api.json) を起動のたびに消してから始める。ファイル名はこの下で定義する
+// EXTERNAL_API_STATE_FILENAME と同一の文字列リテラルを直接使う理由も上のブロックと同じ (const は
+// ホイストされない)。
+if (app && isExternalApiProbe) {
+  try {
+    fs.unlinkSync(path.join(app.getPath("userData"), "external-mute-api.json"));
+  } catch (error) {
+    // 初回実行 (ファイルがまだ存在しない) は正常系。
   }
 }
 
@@ -411,7 +447,17 @@ function e2eOffscreenBrowserWindowOptions() {
   // 駆動する) で加える。
   // 外部ミュート制御検証 (--external-mute-probe) も同じ理由 (実 mainWindow.webContents へ実際に
   // IPC を届けて受信を確認する) で加える。
-  if (!isE2ERealJoin && !isMemoryProbe && !isTrayProbe && !isM3CloseSpike && !isM3WindowProbe && !isExternalMuteProbe)
+  // 選択肢 B (--external-api-probe) も同じ理由 (127.0.0.1 の実 HTTP サーバー経由で同じ
+  // mainWindow.webContents へ IPC を届けて受信を確認する) で加える。
+  if (
+    !isE2ERealJoin &&
+    !isMemoryProbe &&
+    !isTrayProbe &&
+    !isM3CloseSpike &&
+    !isM3WindowProbe &&
+    !isExternalMuteProbe &&
+    !isExternalApiProbe
+  )
     return {};
   return { x: E2E_OFFSCREEN_WINDOW_POSITION.x, y: E2E_OFFSCREEN_WINDOW_POSITION.y };
 }
@@ -588,6 +634,17 @@ const state = {
   // unregister する」ためにも使う (どの文字列で登録されているかを main プロセス自身が把握しておく
   // 必要がある)。
   externalMuteHotkeyRegisteredAccelerator: null,
+  // 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2): 実際に listen() へ成功した
+  // http.Server インスタンス。未起動時は null。トレイの「外部制御 API」サブメニューの checkbox の
+  // checked はこの値 (「実際に listen できているか」の実測) から導出する -- externalMuteHotkeyRegisteredAccelerator
+  // と同じ理由 (永続化ファイルの enabled だけを見ると、EADDRINUSE 等の listen() 失敗時に無言で
+  // 食い違う)。
+  externalApiServer: null,
+  // 選択肢 B のレート制限 (design §5.2): 認証失敗の連続回数と、ロックアウト解除時刻 (Date.now() の
+  // ミリ秒、0 は「ロックアウト中でない」の意味)。認証成功のたびに 0 へリセットされる
+  // (authorizeExternalApiRequest() 参照)。
+  externalApiConsecutiveAuthFailures: 0,
+  externalApiLockoutUntil: 0,
 };
 
 // M2 bounds sync: state.callViewBoundsApplyLog の保持上限 (evidence/メモリの肥大化防止。
@@ -607,6 +664,7 @@ if (app) {
     // runM3WindowProbe() (--m3-window-probe) も同じ理由 (popoutCallView()/close=復帰の実駆動) で除外。
     // runExternalMuteProbe() (--external-mute-probe) も同じ理由 (自分の末尾で app.exit() を呼んで
     // ライフサイクルを自己管理する) で除外する。
+    // runExternalApiProbe() (--external-api-probe) も同じ理由で除外する。
     if (
       !isSmoke &&
       !isMemoryProbe &&
@@ -614,7 +672,8 @@ if (app) {
       !isTrayProbe &&
       !isM3CloseSpike &&
       !isM3WindowProbe &&
-      !isExternalMuteProbe
+      !isExternalMuteProbe &&
+      !isExternalApiProbe
     )
       app.quit();
   });
@@ -625,8 +684,11 @@ if (app) {
   // unregisterAll() する。isSmoke 等の run*Probe() 系は自分の末尾で app.exit() (will-quit を発火
   // させない強制終了) を呼ぶため、runExternalMuteProbe() 側でも同じ後始末を個別に行う
   // (このハンドラだけに依存しない、同ファイル該当コメント参照)。
+  // 選択肢 B: 同じ理由でローカル制御 API サーバーも必ず close() する (待受ポートを開いたまま
+  // プロセスだけ終了する状態を作らない)。
   app.on("will-quit", () => {
     globalShortcut.unregisterAll();
+    stopExternalApiServer();
   });
 }
 
@@ -1306,6 +1368,317 @@ function selectExternalMuteHotkeyPreset(presetId) {
   saveExternalMuteHotkeyState({ enabled: ok, preset: nextPreset.id });
 }
 
+// ============================================================================
+// 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2、運用者確定要件 2026-07-12
+// 「A と B の両方を実装する」): localhost 制御 API。
+//
+// v1 でできること (design §4.2「公開する操作の範囲を無害な通話コントロールのみに絞る」):
+//   - POST /v1/mute-toggle: 認証 OK なら triggerExternalMuteToggle() (選択肢 A のホットキー
+//     callback/トレイのアクション項目と全く同じ関数) を呼ぶ。マイクミュートのトグル 1 操作のみ。
+//   - GET  /v1/ping: ペアリング疎通確認用 (認証必須)。
+// 現在のミュート状態の取得/push (状態フィードバック) は v1 スコープ外 -- 選択肢 C (公式 Stream Deck
+// プラグイン) 検討時に再訪する (design §4.3、状態 push があるとボタンの見た目を状態に追従できる)。
+//
+// 引き金の生成元が違うだけで、triggerExternalMuteToggle() 以降 (main→renderer IPC → cinny の
+// callEmbedAtom 経由の toggleMicrophone()) は選択肢 A と完全に共有する (design §4.4)。cinny 側の
+// 変更が一切不要なのはこのため。
+// ============================================================================
+
+// 127.0.0.1 のみ bind する固定既定ポート。IANA の dynamic/private port 範囲 (49152-65535、
+// https://www.iana.org/assignments/service-names-port-numbers/) の中から選ぶことで、
+// レジストリ登録済みのサービス (obs-websocket の既定 4455 等) や開発でよく使われるポート
+// (3000/5173/8080 等) との衝突を避ける。可変にする要件はない (LATER: 設定 UI で変更可能にする案は
+// design §4.2 のスコープ外) ため、定数 1 つで足りる。
+const EXTERNAL_API_DEFAULT_PORT = 58471;
+
+// design §5.2「認証失敗の連続に対するレート制限/一時ロックアウトを設け、総当たりを遅くする」。
+// EXTERNAL_API_LOCKOUT_DURATION_MS は `let` で宣言し、runExternalApiProbe() が決定的な検証のため
+// テスト実行中だけ短縮値へ一時的に差し替えられるようにしてある (triggerExternalMuteToggle() の
+// 一時差し替えパターンと同じ考え方 -- 本番の 60 秒ロックアウトをテストのたびに実際に待つのは
+// 現実的でない)。
+const EXTERNAL_API_LOCKOUT_THRESHOLD = 5;
+let EXTERNAL_API_LOCKOUT_DURATION_MS = 60_000;
+
+// external-mute-hotkey.json と同じ流儀の別ファイル (design §4.2「A の external-mute-hotkey.json と
+// 同じ流儀の別ファイル」)。トピックが違う (こちらは認証トークン + API 有効化フラグ) ので分離する。
+const EXTERNAL_API_STATE_FILENAME = "external-mute-api.json";
+const DEFAULT_EXTERNAL_API_STATE = Object.freeze({ enabled: false, token: null });
+
+function externalApiStateFilePath() {
+  return path.join(app.getPath("userData"), EXTERNAL_API_STATE_FILENAME);
+}
+
+// loadExternalMuteHotkeyState() と同じ fail-safe 方針 (壊れている/存在しないファイルは既定値へ)。
+function loadExternalApiState() {
+  try {
+    const raw = fs.readFileSync(externalApiStateFilePath(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed)) return { ...DEFAULT_EXTERNAL_API_STATE };
+    const enabled = parsed.enabled === true;
+    const token = typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : null;
+    return { enabled, token };
+  } catch (error) {
+    return { ...DEFAULT_EXTERNAL_API_STATE };
+  }
+}
+
+function saveExternalApiState(nextState) {
+  try {
+    fs.mkdirSync(app.getPath("userData"), { recursive: true });
+    fs.writeFileSync(externalApiStateFilePath(), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  } catch (error) {
+    // ベストエフォート -- 永続化の失敗 (書き込み権限等) でトレイの操作自体を止めない
+    // (saveExternalMuteHotkeyState() と同じ方針)。
+    state.widgetMessages.push({
+      t: Date.now(),
+      type: "external-api-state-save-error",
+      error: String(error && error.message ? error.message : error),
+    });
+  }
+}
+
+// design §4.2「アプリ初回起動時にランダムなトークンを生成し...」。base64url は URL/HTTP ヘッダの
+// どちらに出しても追加のエスケープが要らない (Stream Deck プラグイン設定画面への貼り付け UX にも
+// 有利)。32 バイト (256 bit) はブルートフォースに対して十分な長さ (obs-websocket のパスワードより
+// 十分長い、design §4.2 のトークン方式の水準に合わせる)。
+function generateExternalApiToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+// 未生成なら生成して永続化する (トレイの「有効化」checkbox ON / 「トークンをコピー」の両方から
+// 呼ばれる、絶対条件「初回有効化時にランダムトークン生成」)。既に生成済みならそれをそのまま返す
+// (再生成は regenerateExternalApiToken() の責務、こちらは非破壊)。
+function ensureExternalApiToken() {
+  const persisted = loadExternalApiState();
+  if (persisted.token) return persisted.token;
+  const token = generateExternalApiToken();
+  saveExternalApiState({ ...persisted, token });
+  return token;
+}
+
+// トレイの「トークンを再生成」click ハンドラ本体。新トークンを生成・保存する -- 保存後は
+// handleExternalApiRequest() が毎リクエスト loadExternalApiState() で最新のトークンを読むため
+// (キャッシュしない、下のコメント参照)、サーバー再起動なしに旧トークンは即座に失効する。
+function regenerateExternalApiToken() {
+  const persisted = loadExternalApiState();
+  const token = generateExternalApiToken();
+  saveExternalApiState({ ...persisted, token });
+  return token;
+}
+
+// design §4.2「単純な固定トークンの平文比較でも一定の防御にはなるが、タイミング攻撃を避けるため
+// crypto.timingSafeEqual 等の定数時間比較を使う」。
+//
+// 絶対条件「長さ差でも早期 return しない形に注意」への対応: crypto.timingSafeEqual() は 2 つの
+// Buffer の長さが異なると RangeError を投げる仕様のため、素朴な実装は「まず .length を比較し、
+// 違えば早期 return する」形になりがちだが、それ自体が「候補トークンの長さ」をタイミングで漏らす
+// (別のサイドチャネル)。ここでは比較の前に両方を SHA-256 (32 byte 固定長) へハッシュ化してから
+// timingSafeEqual() へ渡すことで、候補トークンの実際の長さに一切依存しない一定長の比較になる
+// (長さの分岐が構造的に存在しない)。
+//
+// `function` 宣言 (const ではない) にしてあるのは、変異ゲート検証 (runExternalApiProbe() の
+// mutationGate) がこの関数だけを一時的に「常に true を返す」実装へ差し替え、(c) の
+// 「誤トークンは 401」というアサーションが実際に FAIL することを実測してから復元するため
+// (triggerExternalMuteToggle の一時差し替えパターンと同じ、外部ミュート制御選択肢 A の
+// d_mutationGate 参照)。
+function tokensMatch(candidateToken, storedToken) {
+  if (typeof candidateToken !== "string" || typeof storedToken !== "string") return false;
+  const candidateHash = crypto.createHash("sha256").update(candidateToken, "utf8").digest();
+  const storedHash = crypto.createHash("sha256").update(storedToken, "utf8").digest();
+  return crypto.timingSafeEqual(candidateHash, storedHash);
+}
+
+// design §5.2「認証失敗の連続に対するレート制限」。認証成功で 0 へリセットする
+// (authorizeExternalApiRequest() 参照)。
+function registerExternalApiAuthFailure() {
+  state.externalApiConsecutiveAuthFailures += 1;
+  if (state.externalApiConsecutiveAuthFailures >= EXTERNAL_API_LOCKOUT_THRESHOLD) {
+    state.externalApiLockoutUntil = Date.now() + EXTERNAL_API_LOCKOUT_DURATION_MS;
+    // design §5.2「無音でずっと悪用され続ける状態を避ける」への対応。認証成功済みトークンでは
+    // 絶対に届かない値 (トークンそのもの) は一切ログへ出さない。ミリ秒のまま出す (秒へ丸めると
+    // runExternalApiProbe() が検証中だけ使う短縮値 (数百 ms) が「0 秒間」と表示され誤解を招くため)。
+    console.warn(
+      `[external-api] ${EXTERNAL_API_LOCKOUT_THRESHOLD} 回連続で認証に失敗したため、` +
+        `${EXTERNAL_API_LOCKOUT_DURATION_MS}ms 間ロックアウトします。`,
+    );
+  }
+}
+
+function resetExternalApiAuthFailures() {
+  state.externalApiConsecutiveAuthFailures = 0;
+}
+
+// 1 リクエストぶんの認証パイプライン。呼び出し順序がそのままチェックの優先順位:
+//   1. レート制限 (ロックアウト中は正しいトークンでも 429 -- design §5.2)
+//   2. Origin ヘッダ (design §4.2「ブラウザ経由の到達阻止」: 存在するだけで一律 403、トークンの
+//      正誤を問わない -- ブラウザの drive-by JS は Origin を必ず送るが Node スクリプトや
+//      Stream Deck プラグインは通常送らない)
+//   3. トークン認証 (tokensMatch()、定数時間比較)
+// 戻り値: { ok: true } または { ok: false, status, code }。
+function authorizeExternalApiRequest(request) {
+  if (state.externalApiLockoutUntil > 0 && Date.now() < state.externalApiLockoutUntil) {
+    return { ok: false, status: 429, code: "rate_limited" };
+  }
+  if (typeof request.headers.origin === "string") {
+    return { ok: false, status: 403, code: "forbidden_origin" };
+  }
+  const persisted = loadExternalApiState();
+  const authHeader = request.headers.authorization;
+  const BEARER_PREFIX = "Bearer ";
+  const candidateToken =
+    typeof authHeader === "string" && authHeader.startsWith(BEARER_PREFIX)
+      ? authHeader.slice(BEARER_PREFIX.length)
+      : "";
+  if (!persisted.token || !tokensMatch(candidateToken, persisted.token)) {
+    registerExternalApiAuthFailure();
+    return { ok: false, status: 401, code: "unauthorized" };
+  }
+  resetExternalApiAuthFailures();
+  return { ok: true };
+}
+
+function sendExternalApiJson(response, status, body) {
+  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  response.end(JSON.stringify(body));
+}
+
+// v1 の公開ルート一覧 (design §4.2「公開する操作の範囲を無害な通話コントロールのみに絞る」)。
+// key: pathname, value: 期待する HTTP method。パス自体が未知なら 404、既知だが method が違えば
+// 405 -- 絶対条件「それ以外のパス/メソッドは 404/405」。
+const EXTERNAL_API_ROUTES = Object.freeze({
+  "/v1/ping": "GET",
+  "/v1/mute-toggle": "POST",
+});
+
+// selfmatrix-desktop のローカル制御 API 本体。127.0.0.1 のみ bind するサーバー (既存の
+// startServer() が cinny/EC 静的ファイルを配信するのとは完全に別の http.Server インスタンス --
+// 混ぜると製品配信用サーバーの攻撃面が広がってしまうため、意図的に分離してある)。
+function handleExternalApiRequest(request, response) {
+  // POST の場合、body を読まずに応答してもソケットが壊れることがあるため明示的に drain する
+  // (v1 のルートはどちらも request body を一切解釈しない -- 認証はヘッダのみで完結する)。
+  request.resume();
+
+  const url = new URL(request.url, `http://127.0.0.1:${EXTERNAL_API_DEFAULT_PORT}`);
+  const expectedMethod = EXTERNAL_API_ROUTES[url.pathname];
+  if (expectedMethod === undefined) {
+    sendExternalApiJson(response, 404, { ok: false, error: "not_found" });
+    return;
+  }
+  if (request.method !== expectedMethod) {
+    sendExternalApiJson(response, 405, { ok: false, error: "method_not_allowed" });
+    return;
+  }
+
+  const authResult = authorizeExternalApiRequest(request);
+  if (!authResult.ok) {
+    sendExternalApiJson(response, authResult.status, { ok: false, error: authResult.code });
+    return;
+  }
+
+  if (url.pathname === "/v1/ping") {
+    sendExternalApiJson(response, 200, { ok: true });
+    return;
+  }
+  // url.pathname === "/v1/mute-toggle" (EXTERNAL_API_ROUTES に列挙された 2 択のうち残る 1 つ)。
+  // design §4.4「配送経路は A と共有する」: 選択肢 A のホットキー callback/トレイのアクション項目と
+  // 全く同じ triggerExternalMuteToggle() を呼ぶだけ -- ここから先 (main→renderer IPC 以降) は
+  // 1 行も選択肢 A と変わらない。
+  triggerExternalMuteToggle();
+  sendExternalApiJson(response, 200, { ok: true });
+}
+
+// design §4.1「登録失敗のハンドリングが必須」と同じ考え方をローカル制御 API にも適用する:
+// server.listen() の EADDRINUSE 等の失敗をサイレントに握りつぶさず、console.warn した上で
+// Promise<false> を返す (呼び出し元がトレイの checkbox を false のままにできるようにする)。
+function startExternalApiServer(port) {
+  if (state.externalApiServer) return Promise.resolve(true); // 既に起動済みなら冪等に成功扱い。
+  return new Promise((resolve) => {
+    const server = http.createServer(handleExternalApiRequest);
+    const onListenError = (error) => {
+      // 絶対条件「衝突時は EADDRINUSE は console warn + メニューのチェックを外し、無言で
+      // 「効かない」状態を作らない」。
+      console.warn(
+        `[external-api] server.listen(${port}, "127.0.0.1") に失敗しました ` +
+          `(${error && error.code ? error.code : error})。外部制御 API は無効のままです。`,
+      );
+      resolve(false);
+    };
+    server.once("error", onListenError);
+    // design §4.2「127.0.0.1 にのみバインドした...0.0.0.0/LAN 待ち受けは行わない」。host 引数を
+    // 明示することが唯一の要件 (省略すると Node は全インターフェースへ bind する)。
+    server.listen(port, "127.0.0.1", () => {
+      server.removeListener("error", onListenError);
+      state.externalApiServer = server;
+      resolve(true);
+    });
+  });
+}
+
+// close() 自体は「新規接続の受け付け停止」を同期的に行うが、実際に OS 側がポートを解放し終える
+// タイミングは 'close' イベント (全接続終了後) まで確定しない。同一プロセス内で close() 直後に
+// 同じポートへ listen() し直す経路 (トグル ON→OFF→ON、runExternalApiProbe() の再起動相当シミュレーション
+// h) では、この確定を待たずに次の listen() を呼ぶと新しいソケットへの初回接続が ECONNRESET になる
+// ことを実機で確認したため、'close' イベントまで待ってから resolve する Promise を返す。呼び出し元が
+// await しなくても (fire-and-forget) 実害はない (production の OFF トグルや will-quit はこの完了を
+// 待つ必要が薄い) が、再 listen() の前段では必ず await すること。
+function stopExternalApiServer() {
+  const server = state.externalApiServer;
+  state.externalApiServer = null;
+  if (!server) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
+// main() 起動時に一度だけ呼ばれる (isExternalApiProductionRun のときだけ、定義箇所コメント参照)。
+// applyExternalMuteHotkeyFromPersistedState() と同じ形: 永続化されている enabled が true のときだけ
+// 実際に listen() を試みる (既定 OFF なので初回起動時は何もしない)。
+async function applyExternalApiFromPersistedState() {
+  const persisted = loadExternalApiState();
+  if (!persisted.enabled) return;
+  const ok = await startExternalApiServer(EXTERNAL_API_DEFAULT_PORT);
+  if (!ok) {
+    // 登録失敗時は永続化状態も false に落とし、次回起動時に「ON のはずなのに効いていない」という
+    // 混乱を残さない (applyExternalMuteHotkeyFromPersistedState() と同じ方針)。
+    saveExternalApiState({ ...persisted, enabled: false });
+  }
+}
+
+// トレイの「外部制御 API」サブメニュー内 checkbox 項目「有効化 (ポート <番号>)」の click ハンドラ
+// 本体。toggleExternalMuteHotkeyEnabled() と同じ形 (現在値は毎回永続化ファイルから実測して反転
+// させる) だが、listen() が非同期のため async にしてある -- 呼び出し元 (trayMenuTemplate() の
+// click) は完了後に refreshTrayMenu() を呼んで checkbox の見た目 (state.externalApiServer の実測
+// 値から導出) を最新化する。
+async function toggleExternalApiEnabled() {
+  const persisted = loadExternalApiState();
+  if (persisted.enabled) {
+    await stopExternalApiServer();
+    saveExternalApiState({ ...persisted, enabled: false });
+    return;
+  }
+  const token = ensureExternalApiToken();
+  const ok = await startExternalApiServer(EXTERNAL_API_DEFAULT_PORT);
+  // listen() が失敗した場合は enabled:false のまま永続化する (startExternalApiServer() が既に
+  // console.warn する、registerExternalMuteHotkey() と同じ方針)。
+  saveExternalApiState({ enabled: ok, token });
+}
+
+// トレイの「トークンをコピー」click ハンドラ本体。トークン未生成なら生成してからコピーする
+// (絶対条件どおり)。Electron の clipboard はシステムクリップボードへ書くだけで、main.cjs はここでも
+// トークンの値をログへ出さない。
+function copyExternalApiToken() {
+  const token = ensureExternalApiToken();
+  clipboard.writeText(token);
+}
+
+const EXTERNAL_API_SUBMENU_LABEL = "外部制御 API";
+const EXTERNAL_API_COPY_TOKEN_LABEL = "トークンをコピー";
+const EXTERNAL_API_REGENERATE_TOKEN_LABEL = "トークンを再生成";
+
+function externalApiEnableMenuLabel() {
+  return `有効化 (ポート ${EXTERNAL_API_DEFAULT_PORT})`;
+}
+
 // M3 step 1 (design §3-5「placement 状態の逆方向 push」): call view の attach 先
 // ("main" | "window" | "none"、computeCallViewAttachedTo() が実contentView階層から逆算する値) を
 // mainWindow (shell-preload.cjs 経由で cinny) へ push する。detachCallView()/attachCallView()/
@@ -1669,6 +2042,43 @@ function trayMenuTemplate() {
             refreshTrayMenu();
           },
         })),
+      ],
+    },
+    // 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2): 「ホットキー」サブメニューと
+    // 同列の兄弟サブメニュー。localhost 制御 API (Stream Deck プラグイン/自作スクリプト向け) の
+    // 有効化とトークン管理をここにまとめる。
+    {
+      label: EXTERNAL_API_SUBMENU_LABEL,
+      submenu: [
+        {
+          label: externalApiEnableMenuLabel(),
+          type: "checkbox",
+          // ホットキー checkbox (上) と同じ理由: checked は「実際に listen できているか」の実測値
+          // (state.externalApiServer) から導出する。永続化ファイルの enabled だけを見ると、
+          // EADDRINUSE 等の listen() 失敗時に checked が見た目上 ON のままになってしまう食い違いを
+          // 避けるため。
+          checked: state.externalApiServer !== null,
+          click: () => {
+            toggleExternalApiEnabled()
+              .then(() => refreshTrayMenu())
+              .catch((error) => {
+                // listen()/close() 自体は内部で try/catch 済みで通常は reject しないが、念のため
+                // 未処理の Promise rejection でプロセスへ影響が出ないようにする (無言で「効かない」
+                // 状態を作らない、という運用者確定要件の精神をここでも踏襲する)。
+                console.warn("[external-api] toggleExternalApiEnabled failed:", error);
+                refreshTrayMenu();
+              });
+          },
+        },
+        { type: "separator" },
+        { label: EXTERNAL_API_COPY_TOKEN_LABEL, click: () => copyExternalApiToken() },
+        {
+          label: EXTERNAL_API_REGENERATE_TOKEN_LABEL,
+          click: () => {
+            regenerateExternalApiToken();
+            refreshTrayMenu();
+          },
+        },
       ],
     },
     { type: "separator" },
@@ -3813,6 +4223,13 @@ async function runTrayProbe() {
   const hotkeySubmenuLabels = Array.isArray(hotkeySubmenuItem?.submenu)
     ? hotkeySubmenuItem.submenu.map((item) => item.label ?? null)
     : [];
+  // 外部ミュート制御 選択肢 B (design/external-mute-control.md §4.2): サブメニュー「外部制御 API」も
+  // 同じ理由でラベル期待値をここに加える (実際の起動/認証/レート制限の挙動検証は
+  // --external-api-probe/runExternalApiProbe() 側の責務)。
+  const externalApiSubmenuItem = menuTemplate.find((item) => item.label === EXTERNAL_API_SUBMENU_LABEL);
+  const externalApiSubmenuLabels = Array.isArray(externalApiSubmenuItem?.submenu)
+    ? externalApiSubmenuItem.submenu.map((item) => item.label ?? null)
+    : [];
   const contextMenuItems = {
     labels: menuLabels,
     containsOpenLabel: menuLabels.some((label) => typeof label === "string" && label.includes("開く")),
@@ -3824,6 +4241,12 @@ async function runTrayProbe() {
     hotkeySubmenuHasAllPresetRadios: EXTERNAL_MUTE_HOTKEY_PRESETS.every((preset) =>
       hotkeySubmenuLabels.includes(preset.radioLabel),
     ),
+    containsExternalApiSubmenuLabel: menuLabels.some((label) => label === EXTERNAL_API_SUBMENU_LABEL),
+    externalApiSubmenuLabels,
+    externalApiSubmenuHasEnableCheckbox: externalApiSubmenuLabels.includes(externalApiEnableMenuLabel()),
+    externalApiSubmenuHasTokenActions:
+      externalApiSubmenuLabels.includes(EXTERNAL_API_COPY_TOKEN_LABEL) &&
+      externalApiSubmenuLabels.includes(EXTERNAL_API_REGENERATE_TOKEN_LABEL),
   };
 
   // trayClickShowsWindow: closeHidesWindow のステップで隠した (または壊れて破棄された)
@@ -3957,6 +4380,9 @@ async function runTrayProbe() {
       contextMenuItems.containsExternalMuteActionLabel &&
       contextMenuItems.containsExternalMuteHotkeySubmenuLabel &&
       contextMenuItems.hotkeySubmenuHasAllPresetRadios &&
+      contextMenuItems.containsExternalApiSubmenuLabel &&
+      contextMenuItems.externalApiSubmenuHasEnableCheckbox &&
+      contextMenuItems.externalApiSubmenuHasTokenActions &&
       trayClickShowsWindow &&
       notificationClickFocusesWindow &&
       autoLaunchToggle.pass &&
@@ -3982,6 +4408,9 @@ async function runTrayProbe() {
   state.callWindow?.destroy();
   if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
   state.server?.close();
+  // 選択肢 B: このモードでは実際には一度も起動しない想定だが (isExternalApiProductionRun が
+  // isTrayProbe を除外している)、念のため二重に安全側へ倒す。
+  stopExternalApiServer();
   app.exit(result.pass ? 0 : 1);
 }
 
@@ -4230,6 +4659,318 @@ async function runExternalMuteProbe() {
 
   if (!result.pass) {
     console.error("[external-mute-probe] FAIL:", JSON.stringify(result, null, 2));
+  }
+
+  state.tray?.destroy();
+  state.sourcePickerWindow?.destroy();
+  state.callWindow?.destroy();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.destroy();
+  state.server?.close();
+  app.exit(result.pass ? 0 : 1);
+}
+
+// runExternalApiProbe() 専用の薄い HTTP クライアント。127.0.0.1:<port> へ実際に TCP 接続して
+// リクエストを送る (このプロセス自身が同じポートで listen しているサーバーへ、別プロセスを介さず
+// 自己ループバックで往復する)。node:http だけで完結させる (このリポジトリの他の箇所と同じく、
+// 検証のためだけに新規依存を増やさない)。
+function externalApiProbeRequest(method, pathname, { token, origin } = {}) {
+  return new Promise((resolve) => {
+    const headers = {};
+    if (token !== undefined) headers.authorization = `Bearer ${token}`;
+    if (origin !== undefined) headers.origin = origin;
+    const request = http.request(
+      { hostname: "127.0.0.1", port: EXTERNAL_API_DEFAULT_PORT, path: pathname, method, headers },
+      (response) => {
+        let body = "";
+        response.on("data", (chunk) => {
+          body += chunk;
+        });
+        response.on("end", () => {
+          let json = null;
+          try {
+            json = JSON.parse(body);
+          } catch (error) {
+            json = null;
+          }
+          resolve({ status: response.statusCode, json });
+        });
+      },
+    );
+    // (a) 既定 OFF の検証で使う: サーバーが listen していなければここが 'error' (ECONNREFUSED) で
+    // 発火する。resolve() を 1 回だけ呼ぶ (成功パスと排他)。
+    request.on("error", (error) => {
+      resolve({ status: null, error: String(error && error.code ? error.code : error) });
+    });
+    request.end();
+  });
+}
+
+// 選択肢 B の検証専用モード (--external-api-probe, design/external-mute-control.md §4.2/§4.4)。
+// Stream Deck プラグインや自作スクリプトからの実接続は自動化しにくいため、tray-probe/
+// runExternalMuteProbe() と同じ方針 (ロジック本体を main プロセス内から直接呼び、かつこのプロセス
+// 自身が listen している 127.0.0.1:<port> へ実際に HTTP リクエストを送って機械的に検証する) を
+// 踏襲する。
+//
+// 検証する内容 (完了報告の宛先の記号に対応):
+//   a. 既定 OFF: サーバーが listen していない (接続拒否)。
+//   b. 有効化 (トレイの checkbox click ハンドラと同一の toggleExternalApiEnabled()) →
+//      server.address() が 127.0.0.1 (0.0.0.0 でない) + ping が正トークンで 200。
+//   c. 誤トークン → 401、かつ renderer への配達が起きない (runExternalMuteProbe() と同じ
+//      window.__selfmatrixExternalMuteToggleEvents カウンタを再利用する -- 選択肢 A/B は
+//      triggerExternalMuteToggle() 以降を完全共有するため、同じ計測がそのまま使える)。
+//   変異ゲート: tokensMatch() を「常に true を返す」実装へ一時的に差し替え、c の
+//      「誤トークンは 401 かつ配達されない」が実際に FAIL (200 かつ配達される) することを実測してから
+//      復元し、再度 PASS することを確認する。
+//   d. 正トークン POST /v1/mute-toggle → 200 + renderer 側で受信。
+//   e. 正トークンでも Origin ヘッダ付き → 403。
+//   f. 誤トークン連続 5 回 → 6 回目は 429 (正トークンでも 429)。ロックアウト解除後は回復する
+//      (EXTERNAL_API_LOCKOUT_DURATION_MS を検証中だけ短縮して実測する、同定数のコメント参照)。
+//   g. トークン再生成 (トレイの「トークンを再生成」click ハンドラと同一の
+//      regenerateExternalApiToken()) → 旧トークン 401 / 新トークン 200。
+//   h. 有効化状態とトークンが再起動相当 (サーバーを閉じてから applyExternalApiFromPersistedState()
+//      を再実行する) で復元される。
+//
+// 絶対条件: 実トークン値を evidence JSON に焼き込まない。以下の各ステップは全てステータスコードや
+// 真偽値だけを記録し、生成/送信したトークン文字列そのものを result オブジェクトへ入れない。
+async function runExternalApiProbe() {
+  const win = state.mainWindow;
+
+  // クリーンな状態から始める (userData のリセットは main() 冒頭の isExternalApiProbe reset ブロック
+  // で既に実施済み。ここではメモリ内状態も念のためリセットする)。
+  await stopExternalApiServer();
+  state.externalApiConsecutiveAuthFailures = 0;
+  state.externalApiLockoutUntil = 0;
+
+  // renderer 側の受信計測セットアップ (runExternalMuteProbe() と全く同じ経路 -- claimWidgetTransport()
+  // はこのプロセスにとって初回なので成功する)。
+  const setupResult = await win.webContents.executeJavaScript(
+    `(() => {
+      try {
+        window.__selfmatrixExternalMuteToggleEvents = [];
+        const transport = window.selfmatrixNative.claimWidgetTransport();
+        const hasMethod = typeof transport.onExternalMuteToggle === "function";
+        if (hasMethod) {
+          transport.onExternalMuteToggle(() => {
+            window.__selfmatrixExternalMuteToggleEvents.push(Date.now());
+          });
+        }
+        return { ok: true, hasMethod };
+      } catch (error) {
+        return { ok: false, error: String(error && error.message ? error.message : error) };
+      }
+    })()`,
+    true,
+  );
+
+  // a. 既定 OFF。
+  const beforeEnablePing = await externalApiProbeRequest("GET", "/v1/ping", { token: "not-enabled-yet" });
+  const defaultOff = {
+    connectionRefused: beforeEnablePing.status === null,
+    errorCode: beforeEnablePing.error ?? null,
+    persistedEnabled: loadExternalApiState().enabled,
+  };
+  defaultOff.pass = defaultOff.connectionRefused === true && defaultOff.persistedEnabled === false;
+
+  // b. 有効化: トレイの checkbox click ハンドラと同一の関数。
+  await toggleExternalApiEnabled(); // OFF -> ON (未生成ならトークンも生成される)
+  const address = state.externalApiServer ? state.externalApiServer.address() : null;
+  const token = loadExternalApiState().token;
+  const pingResult = await externalApiProbeRequest("GET", "/v1/ping", { token });
+  const enable = {
+    serverRunning: Boolean(state.externalApiServer),
+    boundAddress: address ? address.address : null,
+    pingStatus: pingResult.status,
+    pingOk: Boolean(pingResult.json && pingResult.json.ok === true),
+  };
+  enable.pass =
+    enable.serverRunning && enable.boundAddress === "127.0.0.1" && pingResult.status === 200 && enable.pingOk;
+
+  // c. 誤トークン。
+  const WRONG_TOKEN_1 = "wrong-token-does-not-match-stored-value";
+  const beforeWrongToken = await readExternalMuteToggleEventCount(win);
+  const wrongTokenResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: WRONG_TOKEN_1 });
+  await wait(200);
+  const afterWrongToken = await readExternalMuteToggleEventCount(win);
+  const wrongToken = {
+    status: wrongTokenResult.status,
+    deliveredCount: afterWrongToken - beforeWrongToken,
+  };
+  wrongToken.pass = wrongToken.status === 401 && wrongToken.deliveredCount === 0;
+
+  // 変異ゲート: tokensMatch() (定数時間比較の本体) を一時的に「常に true」へ差し替え、c のアサーション
+  // が実際に FAIL することを実測してから復元し、再度 PASS することを確認する。
+  const originalTokensMatch = tokensMatch;
+  // eslint-disable-next-line no-func-assign -- 意図的な一時差し替え (mutation gate)。下で必ず復元する。
+  tokensMatch = () => true;
+  const beforeMutated = await readExternalMuteToggleEventCount(win);
+  const mutatedResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: WRONG_TOKEN_1 });
+  await wait(200);
+  const afterMutated = await readExternalMuteToggleEventCount(win);
+  // eslint-disable-next-line no-func-assign -- 復元。
+  tokensMatch = originalTokensMatch;
+  // mutationBreaksRejection === true は「この変異下では誤トークンが 200 で通り、実際に配達される」
+  // ことの実測 -- つまり c の「誤トークンは 401 かつ配達されない」というアサーションはこの変異下で
+  // 実際に FAIL する (数値上は「壊れたことを検知できた」の意味で true が望ましい結果)。
+  const mutationBreaksRejection = mutatedResult.status === 200 && afterMutated === beforeMutated + 1;
+  const beforeRestored = await readExternalMuteToggleEventCount(win);
+  const restoredResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: WRONG_TOKEN_1 });
+  await wait(200);
+  const afterRestored = await readExternalMuteToggleEventCount(win);
+  const restoredPassesAgain = restoredResult.status === 401 && afterRestored === beforeRestored;
+  const mutationGate = {
+    mutatedStatus: mutatedResult.status,
+    mutatedDeliveredCount: afterMutated - beforeMutated,
+    mutationBreaksRejection,
+    restoredStatus: restoredResult.status,
+    restoredDeliveredCount: afterRestored - beforeRestored,
+    restoredPassesAgain,
+    pass: mutationBreaksRejection && restoredPassesAgain,
+  };
+
+  // d. 正トークン POST /v1/mute-toggle → 200 + renderer 受信 (成功なので c/変異ゲートで積んだ
+  // 連続失敗カウンタもここで 0 へリセットされる、resetExternalApiAuthFailures() 参照)。
+  const beforeCorrect = await readExternalMuteToggleEventCount(win);
+  const correctResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token });
+  await wait(200);
+  const afterCorrect = await readExternalMuteToggleEventCount(win);
+  const correctToken = {
+    status: correctResult.status,
+    deliveredCount: afterCorrect - beforeCorrect,
+  };
+  correctToken.pass = correctResult.status === 200 && correctToken.deliveredCount === 1;
+
+  // e. 正トークンでも Origin ヘッダ付き → 403 (ブラウザ drive-by 拒否、design §4.2)。
+  const beforeOrigin = await readExternalMuteToggleEventCount(win);
+  const originResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", {
+    token,
+    origin: "http://external-mute-control-probe.invalid",
+  });
+  await wait(200);
+  const afterOrigin = await readExternalMuteToggleEventCount(win);
+  const originRejected = {
+    status: originResult.status,
+    deliveredCount: afterOrigin - beforeOrigin,
+  };
+  originRejected.pass = originResult.status === 403 && originRejected.deliveredCount === 0;
+
+  // f. レート制限: 誤トークン連続 5 回 → 6 回目 (誤トークン) は 429、7 回目 (正トークン!) も 429、
+  // ロックアウト解除後は回復する。EXTERNAL_API_LOCKOUT_DURATION_MS を検証中だけ短縮する (本番の
+  // 60 秒ロックアウトをテストのたびに実際に待つのは非現実的、同定数のコメント参照)。
+  state.externalApiConsecutiveAuthFailures = 0;
+  state.externalApiLockoutUntil = 0;
+  const originalLockoutDurationMs = EXTERNAL_API_LOCKOUT_DURATION_MS;
+  const SHORT_LOCKOUT_MS_FOR_TEST = 300;
+  EXTERNAL_API_LOCKOUT_DURATION_MS = SHORT_LOCKOUT_MS_FOR_TEST;
+  const WRONG_TOKEN_2 = "another-wrong-token-for-rate-limit-test";
+  const fiveFailureStatuses = [];
+  for (let i = 0; i < EXTERNAL_API_LOCKOUT_THRESHOLD; i += 1) {
+    // eslint-disable-next-line no-await-in-loop -- 意図的に直列 (連続失敗回数を数える検証のため)。
+    const attempt = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: WRONG_TOKEN_2 });
+    fiveFailureStatuses.push(attempt.status);
+  }
+  const sixthWrongTokenResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: WRONG_TOKEN_2 });
+  const seventhCorrectTokenResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token });
+  await wait(SHORT_LOCKOUT_MS_FOR_TEST + 200); // ロックアウト解除を待つ (短縮定数を使用)
+  const recoveredResult = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token });
+  EXTERNAL_API_LOCKOUT_DURATION_MS = originalLockoutDurationMs; // 本番の 60 秒へ復元
+  const rateLimit = {
+    fiveFailureStatuses,
+    sixthWrongTokenStatus: sixthWrongTokenResult.status,
+    seventhCorrectTokenStatus: seventhCorrectTokenResult.status,
+    recoveredStatus: recoveredResult.status,
+  };
+  rateLimit.pass =
+    fiveFailureStatuses.every((status) => status === 401) &&
+    rateLimit.sixthWrongTokenStatus === 429 &&
+    rateLimit.seventhCorrectTokenStatus === 429 &&
+    rateLimit.recoveredStatus === 200;
+  state.externalApiConsecutiveAuthFailures = 0;
+  state.externalApiLockoutUntil = 0;
+
+  // g. トークン再生成: トレイの「トークンを再生成」click ハンドラと同一の関数。
+  const oldToken = loadExternalApiState().token;
+  const newToken = regenerateExternalApiToken();
+  const oldTokenAfterRegen = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: oldToken });
+  const newTokenAfterRegen = await externalApiProbeRequest("POST", "/v1/mute-toggle", { token: newToken });
+  const tokenRegeneration = {
+    tokensDiffer: oldToken !== newToken,
+    oldTokenStatus: oldTokenAfterRegen.status,
+    newTokenStatus: newTokenAfterRegen.status,
+  };
+  tokenRegeneration.pass =
+    tokenRegeneration.tokensDiffer &&
+    tokenRegeneration.oldTokenStatus === 401 &&
+    tokenRegeneration.newTokenStatus === 200;
+  state.externalApiConsecutiveAuthFailures = 0;
+  state.externalApiLockoutUntil = 0;
+
+  // h. 再起動相当での復元: サーバーを閉じてメモリ状態をリセットし (プロセス終了を模す)、main() が
+  // 本番起動時に呼ぶのと同じ applyExternalApiFromPersistedState() を再実行する。close() の完了
+  // ('close' イベント) を待ってから listen() し直す (stopExternalApiServer() のコメント参照 --
+  // 待たずに同一ポートへ listen() し直すと初回接続が ECONNRESET になることを実機で確認した)。
+  await stopExternalApiServer();
+  await wait(150);
+  const persistedBeforeRestart = loadExternalApiState();
+  await applyExternalApiFromPersistedState();
+  const addressAfterRestart = state.externalApiServer ? state.externalApiServer.address() : null;
+  const pingAfterRestart = await externalApiProbeRequest("GET", "/v1/ping", {
+    token: persistedBeforeRestart.token,
+  });
+  const restartRestore = {
+    persistedEnabledBeforeRestart: persistedBeforeRestart.enabled,
+    serverRunningAfterRestart: Boolean(state.externalApiServer),
+    boundAddressAfterRestart: addressAfterRestart ? addressAfterRestart.address : null,
+    pingStatusAfterRestart: pingAfterRestart.status,
+    pingAfterRestartErrorCode: pingAfterRestart.error ?? null,
+  };
+  restartRestore.pass =
+    restartRestore.persistedEnabledBeforeRestart === true &&
+    restartRestore.serverRunningAfterRestart &&
+    restartRestore.boundAddressAfterRestart === "127.0.0.1" &&
+    restartRestore.pingStatusAfterRestart === 200;
+
+  const result = {
+    pass:
+      defaultOff.pass &&
+      enable.pass &&
+      wrongToken.pass &&
+      mutationGate.pass &&
+      correctToken.pass &&
+      originRejected.pass &&
+      rateLimit.pass &&
+      tokenRegeneration.pass &&
+      restartRestore.pass,
+    a_defaultOff: defaultOff,
+    b_enable: enable,
+    c_wrongToken: wrongToken,
+    mutationGate,
+    d_correctToken: correctToken,
+    e_originRejected: originRejected,
+    f_rateLimit: rateLimit,
+    g_tokenRegeneration: tokenRegeneration,
+    h_restartRestore: restartRestore,
+    setupResult,
+    port: EXTERNAL_API_DEFAULT_PORT,
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+  };
+
+  // 後始末: サーバーを閉じ、レート制限内部状態と永続化ファイルを既定へ戻す (次回実行の決定性を保つ、
+  // runExternalMuteProbe() の後始末と同じ方針)。
+  await stopExternalApiServer();
+  state.externalApiConsecutiveAuthFailures = 0;
+  state.externalApiLockoutUntil = 0;
+  saveExternalApiState({ ...DEFAULT_EXTERNAL_API_STATE });
+
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, "external-api-probe-result.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+    "utf8",
+  );
+
+  if (!result.pass) {
+    console.error("[external-api-probe] FAIL:", JSON.stringify(result, null, 2));
   }
 
   state.tray?.destroy();
@@ -5104,6 +5845,9 @@ async function main() {
   // 外部ミュート制御 選択肢 A: 本番相当の起動でのみ、永続化された enabled: true を実際の
   // globalShortcut 登録へ反映する (isExternalMuteHotkeyProductionRun の定義箇所コメント参照)。
   if (isExternalMuteHotkeyProductionRun) applyExternalMuteHotkeyFromPersistedState();
+  // 選択肢 B: 同じく本番相当の起動でのみ、永続化された enabled: true を実際の listen() へ反映する
+  // (isExternalApiProductionRun の定義箇所コメント参照)。
+  if (isExternalApiProductionRun) await applyExternalApiFromPersistedState();
   if (isSmoke) await runSmoke();
   if (isMemoryProbe) await runMemoryProbe();
   if (isCinnyShellSmoke) await runCinnyShellSmoke();
@@ -5111,6 +5855,7 @@ async function main() {
   if (isM3CloseSpike) await runM3CloseSpikeProbe();
   if (isM3WindowProbe) await runM3WindowProbe();
   if (isExternalMuteProbe) await runExternalMuteProbe();
+  if (isExternalApiProbe) await runExternalApiProbe();
 }
 
 function evidenceFileForMode() {
@@ -5120,6 +5865,7 @@ function evidenceFileForMode() {
   if (isM3CloseSpike) return "m3-close-spike-result.json";
   if (isM3WindowProbe) return "m3-window-probe-result.json";
   if (isExternalMuteProbe) return "external-mute-probe-result.json";
+  if (isExternalApiProbe) return "external-api-probe-result.json";
   return "smoke-result.json";
 }
 
