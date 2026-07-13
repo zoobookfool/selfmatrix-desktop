@@ -3912,8 +3912,9 @@ async function runCinnyShellSmoke() {
   // 7. (G3, 受け入れレビュー修正) NativeCallControlAction 7 語彙を全て実際に
   // transport.callControlInvoke() で invoke する。このプロトタイプにはバックエンドが無く、
   // EC は ErrorView (Room not found) しか描画しないため in-call UI (screenshare/spotlight/
-  // emphasis/reactions/settings/sound の実コントロール) は存在しない — そのため各 action は
-  // 例外を投げず `{ok:false, reason:"target_not_found"}` を返すのが正しい挙動。
+  // emphasis/reactions/settings) は存在しない — そのため DOM action は例外を投げず
+  // `{ok:false, reason:"target_not_found"}` を返す。sound は相手が 0 人でも状態を保持する契約なので
+  // audioCount:0 の `{ok:true}` を返すのが正しい。
   // call-control-preload.cjs の switch 分岐からその action の case が抜け落ちると default 節
   // (`{ok:false, reason:"unknown_action"}`) に落ちるため、reason が "unknown_action" になった
   // 場合は語彙の欠落 (=cinny 側の契約を満たしていない) と判定して FAIL にする。例外/タイムアウト
@@ -3935,14 +3936,16 @@ async function runCinnyShellSmoke() {
     }
     const reason =
       outcome.result && typeof outcome.result === "object" ? outcome.result.reason : undefined;
+    const isSoundAction = action === "setSoundOn" || action === "setSoundOff";
     vocabulary[action] = {
       result: outcome.result,
       error: outcome.error,
       pass:
         outcome.error === null &&
         Boolean(outcome.result) &&
-        outcome.result.ok === false &&
-        reason === "target_not_found",
+        (isSoundAction
+          ? outcome.result.ok === true && outcome.result.audioCount === 0
+          : outcome.result.ok === false && reason === "target_not_found"),
     };
   }
   const vocabularyPass = Object.values(vocabulary).every((entry) => entry.pass);
@@ -4237,6 +4240,7 @@ async function runTrayProbe() {
   const win = state.mainWindow;
 
   const trayCreated = Boolean(state.tray) && !state.tray.isDestroyed();
+  const applicationMenuRemoved = Menu.getApplicationMenu() === null;
 
   // closeHidesWindow: 合成 emit ではなく本物の win.close() を呼ぶ。close ハンドラの
   // event.preventDefault() が外れる変異が入った場合、この呼び出しは実際にウィンドウを破棄して
@@ -4422,6 +4426,7 @@ async function runTrayProbe() {
       trayClickShowsWindow &&
       notificationClickFocusesWindow &&
       autoLaunchToggle.pass &&
+      applicationMenuRemoved &&
       quitMenuReallyQuits,
     trayCreated,
     closeHidesWindow,
@@ -4431,6 +4436,7 @@ async function runTrayProbe() {
     notificationDispatchOutcome,
     notificationProbeAttempts,
     autoLaunchToggle,
+    applicationMenuRemoved,
     quitMenuReallyQuits,
     electron: process.versions.electron,
     chrome: process.versions.chrome,
@@ -5827,6 +5833,10 @@ async function runMinisignProbe() {
 
 async function main() {
   await app.whenReady();
+  // SelfMatrix is a Discord-style application shell, so Electron's default
+  // File/Edit/View/Window application menu is not part of the product UI.
+  // Removing the application menu also removes it from call popout windows.
+  Menu.setApplicationMenu(null);
   if (!fs.existsSync(path.join(cinnyDist, "index.html"))) {
     throw new Error(
       `Cinny dist not found: ${cinnyDist}\n` +

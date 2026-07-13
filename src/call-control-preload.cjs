@@ -25,8 +25,9 @@
 // NativeCallControlAction 契約): CallControl.ts の実セレクタを移植し、7 action
 // (toggleScreenshare/toggleSpotlight/toggleEmphasis/toggleReactions/toggleSettings/
 // setSoundOn/setSoundOff) を実装した。この prototype 環境ではバックエンドが無いため EC は
-// ErrorView (Room not found) を描画し、これらのセレクタはいずれも実在しない — 各 handler は
-// 対象が見つからなければ例外を投げず `{ok:false, reason:"target_not_found"}` を返す (設計要件どおり)。
+// ErrorView (Room not found) を描画し、DOM ボタンのセレクタは実在しない — 各 DOM handler は
+// 対象が見つからなければ例外を投げず `{ok:false, reason:"target_not_found"}` を返す。sound は
+// Discord の deafen と同様、相手が 0 人でも希望状態を保持し、後から現れた audio に適用する。
 // 実 in-call UI に接続された際は、対象がそのまま見つかるようになる想定でセレクタは CallControl.ts と
 // 完全に同じ文字列にしてある。
 //
@@ -242,6 +243,7 @@ function footerElement() {
 // -- top-level で登録済みの ipcRenderer.on("native:set-footer-visible", ...) が確実にその出現より
 // 先に (少なくとも同じくらい早く) 届く。
 let footerVisible = false;
+let desiredSoundOn = true;
 
 // 元実装: CallControl.ts の onBodyMutation() のフッター部分。hidden 時は web 版と同一の
 // position:absolute + visibility:hidden (隠れている間はレイアウト上の場所を取らない)。visible 時は
@@ -261,6 +263,15 @@ function applyFooterVisibility() {
   }
 }
 
+function applyDesiredSound() {
+  const audios = document.querySelectorAll("audio");
+  audios.forEach((el) => {
+    // eslint-disable-next-line no-param-reassign
+    el.muted = !desiredSoundOn;
+  });
+  return audios.length;
+}
+
 // CallControl.ts の onControlMutation() と同じ計算: screenshare は data-kind 属性、
 // spotlight/emphasis は checked プロパティ (属性ではない) を直接読む。
 function computeCallControlState() {
@@ -276,23 +287,20 @@ function computeCallControlState() {
 
 // G4 (受け入れレビュー修正、対称化): setSoundOn/setSoundOff だけが他のカテゴリ B action と違い
 // push の対象になっていなかった。CallControl.ts の setSound() 相当 (audio 要素の muted 反転) の
-// 「実測」値を返す — handleSetSound() の呼び出し引数をそのまま echo するのではなく、実際に
-// document 上の <audio> 要素群の muted プロパティを読み直す。複数 audio 要素がある場合は
-// 「全て unmuted であって初めて聞こえる」という意味で AND を取る。<audio> が 1 つも無ければ
-// (target_not_found で ok:false になる状況と同じ) undefined を返し、呼び出し側で sound
-// フィールド自体を push に含めない。
+// 「実測」値を返す — audio がある場合は document 上の muted プロパティを読み直し、複数なら
+// 「全て unmuted であって初めて聞こえる」という意味で AND を取る。audio が 0 件なら、後から
+// 参加者が現れた時に適用する desiredSoundOn を返し、単独参加中も deafen 状態を保持する。
 function computeSoundState() {
   const audios = document.querySelectorAll("audio");
-  if (audios.length === 0) return undefined;
+  if (audios.length === 0) return desiredSoundOn;
   return Array.from(audios).every((el) => el.muted === false);
 }
 
 // M1 step 3b 実装要件 4: NativeCallControl.ts の onCallControlState 購読が「push による再同期」
 // として受け取る形。kind:"call-control" で従来の toggleTarget 系 push (kind:"legacy-target") と
 // 区別する (host 側はどちらも受け取り得るので、フィールドの有無で安全に無視できるようにしてある)。
-// G4: sound フィールドを追加した (対称化) — computeSoundState() が undefined を返す場合
-// (audio 要素が無い) は push に sound キー自体を含めない (nativeBridge.ts の duck typing と
-// 同じ「フィールドが無ければ無視される」契約を preload 側でも踏襲する)。
+// G4: sound フィールドを追加した (対称化)。computeSoundState() は audio が 0 件でも保持中の
+// 希望状態を返すため、単独参加中の操作も host UI へ同期される。
 function pushCallControlState(reason) {
   const computed = computeCallControlState();
   const sound = computeSoundState();
@@ -387,6 +395,7 @@ function ensureBodyObserver() {
     // footerVisible を確実に再適用するため (controlElementsChanged() のガードに相乗りすると、
     // 3 要素は変わらずフッターだけ差し替わったケースを取りこぼす)。
     applyFooterVisibility();
+    applyDesiredSound();
     if (controlElementsChanged()) observeCallControls();
   });
   bodyMutationObserver.observe(document.body, { childList: true, subtree: true });
@@ -443,20 +452,15 @@ function handleToggleSettings() {
 }
 
 // 元実装: CallControl.ts の setSound() (iframe の contentDocument 内の <audio> 要素の
-// muted を直接操作)。対象が 1 つも無い場合は target_not_found を返す (例外にしない)。
+// muted を直接操作)。相手が 0 人でも希望状態を保持し、後から audio が追加された時に
+// bodyMutationObserver から適用する。
 // G4 (受け入れレビュー修正、対称化): 成功時、他のカテゴリ B action と同様 pushCallControlState()
 // を呼ぶ (以前は setSoundOn/setSoundOff だけ push が無かった)。
 function handleSetSound(soundOn, action) {
-  const audios = document.querySelectorAll("audio");
-  if (audios.length === 0) {
-    return { ok: false, reason: "target_not_found", action };
-  }
-  audios.forEach((el) => {
-    // eslint-disable-next-line no-param-reassign
-    el.muted = !soundOn;
-  });
+  desiredSoundOn = soundOn;
+  const audioCount = applyDesiredSound();
   pushCallControlState(`action-${action}`);
-  return { ok: true, action, audioCount: audios.length };
+  return { ok: true, action, audioCount };
 }
 
 // -------------------------------------------------------------------------------------------
