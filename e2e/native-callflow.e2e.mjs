@@ -11,7 +11,7 @@
  *   1. alice が native-join と同じ経路 (cinny 実ログイン → Voice Lounge → 参加) で join する。
  *   2. bob (2 人目) を 2 個目の Electron インスタンスで同じ経路で join させ、alice 側から見て
  *      2 ユーザー通話が成立したことを実測する (参加者タイル数 + inbound-rtp audio 増加)。
- *   3. alice 側の claim 済み transport から `callControlInvoke` で 7 語彙
+ *   3. alice 側の claim 済み transport から互換 RPC の 7 語彙
  *      (toggleScreenshare/toggleSpotlight/toggleEmphasis/toggleReactions/toggleSettings/
  *      setSoundOff/setSoundOn) を実行し、実 in-call DOM への到達と `onCallControlState` push に
  *      よる再同期 (main の中継記録 + cinny 自身の DOM の両方) を確認する。
@@ -23,12 +23,8 @@
  *      (`callViewAttachedTo`, state 文字列とは独立した積極的証拠) が detach 後に "window"、
  *      attach 後に "main" へ実際に遷移したことも確認する (H1、受け入れレビュー修正 -- state だけ
  *      書き換えて実体を動かさない no-op 化回帰の検知)。
- *   4.5 (SelfMatrix M3 step 5) cinny 自身の実 ⧉ ボタン (`call_popout`/`call_popin`) を実クリックし、
- *      production 配線 (CallControls.tsx の onClick → useNativeCallPopoutToggle() →
- *      NativeCallEmbed.popout()/popin() → transport → IPC → main.cjs の
- *      detachCallView()/attachCallView()) をエンドツーエンドで検証する
- *      (`runRealPopoutPopinClick()`) -- 4. の直接呼び出し経路は cinny 側の TS 層を一切経由しない
- *      ため、この節がその穴を塞ぐ。
+ *   4.5 Element Call の共通通話バーにある別窓/戻す/固定/全画面ボタンを実クリックし、
+ *      trusted preload → validated IPC → WebContentsView reparenting の製品経路と無再接続を検証する。
  *   4.6 (SelfMatrix M3 step 5、M3 の最重要判定) 別窓をユーザーが実際に閉じたとき
  *      (`__selfmatrixE2E.closeCallWindow()` = `state.callWindow.close()`、win.destroy() ではない
  *      実 X ボタンと同じ経路) の「メインへの自動復帰・無再接続・通話継続 (dispose 誤発火なし)」を
@@ -36,10 +32,8 @@
  *   5. cinny (mainWindow) と call view (別 session partition) 間の `matrix-setting-*`
  *      localStorage 契約が分離後も生きるかを実測する (M1 step 3c-2 で発見・修正した契約: 詳細は
  *      README とこのファイル内 `verifyLocalStorageContract()` のコメント参照)。
- *   6. 通話中に画質/FPS 設定を変更した場合、cinny 自身の実 UI (画面共有ボタンの再クリック) が
- *      call view の localStorage を「共有再開のたびに」再同期することを実測する (H3、受け入れ
- *      レビュー修正 -- `verifyMidCallSettingsSync()` 参照。web 版の実契約 (`LocalMember.ts`) との
- *      等価性を狙ったもの)。
+ *   6. 共通通話バーで画質/FPS を変更し、同じ Element Call renderer が次回共有へ設定を
+ *      適用することと、ネイティブ共有元ピッカーを通ることを実測する。
  *
  * **絶対条件 (native-join.e2e.mjs と同一)**: 実オーディオデバイス不使用 (fake media)、
  * dev パスワードは環境変数からのみ (`SELFMATRIX_E2E_PASSWORD_ALICE`/`_BOB`)、証跡・ログに
@@ -268,11 +262,48 @@ async function latestStatePush(aliceApp, sinceT) {
   return pushes.length > 0 ? pushes[pushes.length - 1] : null;
 }
 
-async function getDomAriaPressed(alicePage, testid) {
-  const locator = alicePage.locator(`[data-testid="${testid}"]`);
-  const count = await locator.count();
-  if (count === 0) return null;
-  return locator.first().getAttribute("aria-pressed");
+async function getCallViewAttribute(electronApp, testid, attribute) {
+  return evalInCallView(
+    electronApp,
+    `(() => {
+      const element = document.querySelector(${JSON.stringify(`[data-testid="${testid}"]`)});
+      return element ? element.getAttribute(${JSON.stringify(attribute)}) : null;
+    })()`,
+  ).then((result) => (result?.ok ? result.value : null));
+}
+
+async function getCallViewChecked(electronApp, selector) {
+  return evalInCallView(
+    electronApp,
+    `(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      return element && "checked" in element ? Boolean(element.checked) : null;
+    })()`,
+  ).then((result) => (result?.ok ? result.value : null));
+}
+
+async function clickCallViewControl(electronApp, testid) {
+  return evalInCallView(
+    electronApp,
+    `(() => {
+      const element = document.querySelector(${JSON.stringify(`[data-testid="${testid}"]`)});
+      if (!element) return { ok: false, reason: "target_not_found" };
+      element.click();
+      return { ok: true };
+    })()`,
+  );
+}
+
+async function clickCallViewSelector(electronApp, selector) {
+  return evalInCallView(
+    electronApp,
+    `(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element) return { ok: false, reason: "target_not_found" };
+      element.click();
+      return { ok: true };
+    })()`,
+  );
 }
 
 // M2 画面共有ソース選択 UI: screenshare を開始すると main.cjs のネイティブピッカーが実際に開く
@@ -292,7 +323,7 @@ async function toggleScreenshareViaNativePicker(aliceApp, alicePage) {
   // keep-alive オーバーレイを仕込んでおく (main.cjs の registerDisplayMediaHandler コメント、
   // startKeepAliveOverlay() コメント参照)。
   await startKeepAliveOverlay(alicePage);
-  const before = await getDomAriaPressed(alicePage, "call_control_screenshare");
+  const before = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
   const sendersBefore = (await evalInCallView(aliceApp, SENDER_KIND_COUNT_SCRIPT)).value ?? { audio: 0, video: 0 };
   const t0 = Date.now();
 
@@ -302,7 +333,7 @@ async function toggleScreenshareViaNativePicker(aliceApp, alicePage) {
 
   await wait(1500);
   const push = await latestStatePush(aliceApp, t0);
-  const after = await getDomAriaPressed(alicePage, "call_control_screenshare");
+  const after = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
   const sendersAfter = (await evalInCallView(aliceApp, SENDER_KIND_COUNT_SCRIPT)).value ?? { audio: 0, video: 0 };
 
   const screenshareStarted =
@@ -363,12 +394,12 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
   // 2. toggleEmphasis — spotlight に切り替える前 (grid モード) にテストする必要がある
   //    (spotlight 中は emphasis の DOM 要素自体が消える、call-control-preload.cjs 参照)。
   {
-    const before = await getDomAriaPressed(alicePage, "call_emphasis_toggle");
+    const before = await getCallViewChecked(aliceApp, '[data-testid="emphasis_toggle"]');
     const t0 = Date.now();
     const invoke = await invokeAliceCallControl(aliceApp, "toggleEmphasis");
     await wait(1000);
     const push = await latestStatePush(aliceApp, t0);
-    const after = await getDomAriaPressed(alicePage, "call_emphasis_toggle");
+    const after = await getCallViewChecked(aliceApp, '[data-testid="emphasis_toggle"]');
     vocabulary.toggleEmphasis = {
       invoke,
       before,
@@ -377,7 +408,7 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
       pass:
         Boolean(invoke.ok && invoke.result && invoke.result.ok === true) &&
         Boolean(push && push.emphasis === true) &&
-        after === "true",
+        after === true,
     };
   }
 
@@ -387,13 +418,13 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
     const invokeOn = await invokeAliceCallControl(aliceApp, "toggleSpotlight");
     await wait(1000);
     const pushOn = await latestStatePush(aliceApp, t0);
-    const afterOn = await getDomAriaPressed(alicePage, "call_layout_toggle");
+    const afterOn = await getCallViewChecked(aliceApp, 'input[value="spotlight"]');
 
     const t1 = Date.now();
     const invokeBack = await invokeAliceCallControl(aliceApp, "toggleSpotlight");
     await wait(1000);
     const pushBack = await latestStatePush(aliceApp, t1);
-    const afterBack = await getDomAriaPressed(alicePage, "call_layout_toggle");
+    const afterBack = await getCallViewChecked(aliceApp, 'input[value="spotlight"]');
 
     vocabulary.toggleSpotlight = {
       invokeOn,
@@ -405,10 +436,10 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
       pass:
         Boolean(invokeOn.ok && invokeOn.result && invokeOn.result.ok === true) &&
         Boolean(pushOn && pushOn.spotlight === true) &&
-        afterOn === "true" &&
+        afterOn === true &&
         Boolean(invokeBack.ok && invokeBack.result && invokeBack.result.ok === true) &&
         Boolean(pushBack && pushBack.spotlight === false) &&
-        afterBack === "false",
+        afterBack === false,
     };
   }
 
@@ -530,99 +561,62 @@ async function runCallControlVocabulary(aliceApp, alicePage) {
   return { vocabulary, pass, sourcePickerVerification };
 }
 
-// SelfMatrix M1 全体レビュー (Fable) test-critical #3 対応: runCallControlVocabulary() の 7 語彙
-// のうち 6 つ (screenshare を除く) は alice の claim 済み transport から
-// `__selfmatrixE2E.invokeCallControl()` (main 直叩きの E2E 専用窓口) で駆動しており、cinny 側の
-// 本番配線 (CallControls.tsx の onClick → NativeCallControl.toggleX() →
-// transport.callControlInvoke()) を一切経由していない -- 実クリックで検証済みなのは
-// verifyMidCallSettingsSync() の screenshare のみだった。
-//
-// この関数は残る対象 (spotlight/emphasis/settings/sound) を alicePage 上の cinny 自身の実ボタンへの
-// 実クリックで駆動し、call-control-preload.cjs 経由の実 DOM 到達と onCallControlState push による
-// cinny 自身の再同期 (aria-pressed の反転) の両方を実測する。screenshare は
-// verifyMidCallSettingsSync() で既に実クリック検証済みのため対象外。reactions は cinny 側
-// (CallControls.tsx) にボタン自体が存在しない (実コード確認済み -- toggleReactions は EC 側の
-// footer にボタンが無い既知ギャップとして runCallControlVocabulary() 側で扱っている) ため対象外。
-//
-// セレクタは CallControls.tsx/Controls.tsx の実コードを確認して選定した:
-//   - spotlight: `[data-testid="call_layout_toggle"]` (既存)
-//   - emphasis: `[data-testid="call_emphasis_toggle"]` (既存、spotlight=false のときのみ
-//     cinny 自身の DOM に存在 -- CallControls.tsx の `{!spotlight && (...)}` 参照)
-//   - settings: `[data-testid="call_menu"]` (既存、PopOut メニューを開く) →
-//     `[data-testid="call_menu_settings"]` (このコミットで cinny 側の MenuItem に追加 -- 元は
-//     testid が無く実クリックで安定して選択できなかった)
-//   - sound: `[data-testid="call_control_sound"]` (このコミットで cinny 側の SoundButton に追加 --
-//     元は testid が全く無かった)
-async function runRealClickVocabulary(aliceApp, alicePage) {
+// Compatibility RPC coverage above proves the retained bridge vocabulary.
+// This separate check clicks the Element Call controls that native users
+// actually see in both main and popout placements.
+async function runRealClickVocabulary(aliceApp) {
   const vocabulary = {};
 
-  // 1. emphasis -- spotlight=false の間 (このセクション開始時点、runCallControlVocabulary() が
-  //    grid モードへ戻して終わっている) に先に検証する必要がある。spotlight=true になると
-  //    emphasis ボタン自体が cinny の DOM から消える。
+  // The native product now uses Element Call's footer in both placements, so
+  // these checks click the controls users actually see rather than Cinny's
+  // compatibility RPC toolbar.
   {
-    const before = await getDomAriaPressed(alicePage, "call_emphasis_toggle");
-    const t0 = Date.now();
-    await alicePage.locator('[data-testid="call_emphasis_toggle"]').click();
-    await wait(1000);
-    const push = await latestStatePush(aliceApp, t0);
-    const after = await getDomAriaPressed(alicePage, "call_emphasis_toggle");
-    const stateConfirmed =
-      Boolean(push && push.emphasis === true) && after === "true" && after !== before;
+    const before = await getCallViewChecked(aliceApp, '[data-testid="emphasis_toggle"]');
+    const click = await clickCallViewControl(aliceApp, "emphasis_toggle");
+    await wait(500);
+    const after = await getCallViewChecked(aliceApp, '[data-testid="emphasis_toggle"]');
     vocabulary.emphasis = {
-      clicked: true,
+      click,
       before,
       after,
-      statePush: push,
-      stateConfirmed,
-      pass: stateConfirmed,
+      pass: Boolean(click?.ok && click.value?.ok && before !== after && after === true),
     };
   }
 
-  // 2. spotlight -- grid → spotlight → grid の往復で実クリックする (レイアウトを汚さない)。
-  //    NativeCallControl.toggleSpotlight() は spotlight=true にする際 emphasis を強制的に
-  //    false へ落とす実装 (NativeCallControl.ts 参照) なので、この往復の終わりには emphasis も
-  //    false に戻る (前段の emphasis テストで true にした分もここで自然にクリーンアップされる)。
   {
-    const beforeOn = await getDomAriaPressed(alicePage, "call_layout_toggle");
-    const t0 = Date.now();
-    await alicePage.locator('[data-testid="call_layout_toggle"]').click();
-    await wait(1000);
-    const pushOn = await latestStatePush(aliceApp, t0);
-    const afterOn = await getDomAriaPressed(alicePage, "call_layout_toggle");
-
-    const t1 = Date.now();
-    await alicePage.locator('[data-testid="call_layout_toggle"]').click();
-    await wait(1000);
-    const pushBack = await latestStatePush(aliceApp, t1);
-    const afterBack = await getDomAriaPressed(alicePage, "call_layout_toggle");
-
-    const stateConfirmed =
-      Boolean(pushOn && pushOn.spotlight === true) &&
-      afterOn === "true" &&
-      afterOn !== beforeOn &&
-      Boolean(pushBack && pushBack.spotlight === false) &&
-      afterBack === "false";
+    const before = await getCallViewChecked(aliceApp, 'input[value="spotlight"]');
+    const clickOn = await clickCallViewSelector(aliceApp, 'input[value="spotlight"]');
+    await wait(500);
+    const afterOn = await getCallViewChecked(aliceApp, 'input[value="spotlight"]');
+    const clickBack = await clickCallViewSelector(aliceApp, 'input[value="grid"]');
+    await wait(500);
+    const afterBack = await getCallViewChecked(aliceApp, 'input[value="spotlight"]');
     vocabulary.spotlight = {
-      clicked: true,
-      beforeOn,
+      clickOn,
+      clickBack,
+      before,
       afterOn,
       afterBack,
-      statePushOn: pushOn,
-      statePushBack: pushBack,
-      stateConfirmed,
-      pass: stateConfirmed,
+      pass:
+        Boolean(clickOn?.ok && clickOn.value?.ok) &&
+        Boolean(clickBack?.ok && clickBack.value?.ok) &&
+        afterOn === true &&
+        afterBack === false,
     };
   }
 
-  // 3. settings -- cinny 側の call_menu → call_menu_settings の実クリックで EC 側の設定
-  //    ダイアログを開き、call view 側の [role="dialog"] 出現を実測してから Escape で閉じる。
-  //    settings は CallControlState に対応フィールドが無く push を伴わない元実装のままなので
-  //    (runCallControlVocabulary() のコメント参照)、判定は state push ではなく実 DOM
-  //    ([role="dialog"]) の出現/消失で行う。
   {
-    await alicePage.locator('[data-testid="call_menu"]').click();
-    await alicePage.locator('[data-testid="call_menu_settings"]').click();
-    await wait(800);
+    const settingsClick = await evalInCallView(
+      aliceApp,
+      `(() => {
+        const button = document.querySelector('[data-testid="settings-bottom-left"]') ||
+          document.querySelector('[data-testid="settings-bottom-center"]');
+        if (!button) return { ok: false, reason: "target_not_found" };
+        button.click();
+        return { ok: true };
+      })()`,
+    );
+    await wait(500);
     const dialogOpened = await evalInCallView(
       aliceApp,
       `document.querySelector('[role="dialog"]') !== null`,
@@ -636,54 +630,37 @@ async function runRealClickVocabulary(aliceApp, alicePage) {
       aliceApp,
       `document.querySelector('[role="dialog"]') === null`,
     );
-    const stateConfirmed =
-      Boolean(dialogOpened.ok && dialogOpened.value === true) &&
-      Boolean(dialogClosed.ok && dialogClosed.value === true);
     vocabulary.settings = {
-      clicked: true,
+      settingsClick,
       dialogOpened,
       dialogClosed,
-      stateConfirmed,
-      pass: stateConfirmed,
+      pass:
+        Boolean(settingsClick?.ok && settingsClick.value?.ok) &&
+        Boolean(dialogOpened.ok && dialogOpened.value === true) &&
+        Boolean(dialogClosed.ok && dialogClosed.value === true),
     };
   }
 
-  // 4. sound -- 2 ユーザー通話中なので bob の <audio> 要素が call view にあるはず。無ければ
-  //    computeSoundState() (call-control-preload.cjs) が undefined を返し push に sound
-  //    フィールド自体が乗らない -- その場合は理由を記録して判定から除外する (pass:true のまま
-  //    skipped:true で明示する)。
   {
-    const audioProbe = await evalInCallView(aliceApp, `document.querySelectorAll('audio').length`);
-    const audioCount = audioProbe.ok && typeof audioProbe.value === 'number' ? audioProbe.value : 0;
-    if (audioCount === 0) {
-      vocabulary.sound = {
-        clicked: false,
-        skipped: true,
-        skipReason: 'no_audio_element_in_call_view',
-        pass: true,
-      };
-    } else {
-      const t0 = Date.now();
-      await alicePage.locator('[data-testid="call_control_sound"]').click();
-      await wait(1000);
-      const pushOff = await latestStatePush(aliceApp, t0);
-
-      const t1 = Date.now();
-      await alicePage.locator('[data-testid="call_control_sound"]').click();
-      await wait(1000);
-      const pushOn = await latestStatePush(aliceApp, t1);
-
-      const stateConfirmed =
-        Boolean(pushOff && pushOff.sound === false) && Boolean(pushOn && pushOn.sound === true);
-      vocabulary.sound = {
-        clicked: true,
-        audioCount,
-        statePushOff: pushOff,
-        statePushOn: pushOn,
-        stateConfirmed,
-        pass: stateConfirmed,
-      };
-    }
+    const before = await getCallViewAttribute(aliceApp, "incall_sound", "aria-checked");
+    const clickOff = await clickCallViewControl(aliceApp, "incall_sound");
+    await wait(500);
+    const afterOff = await getCallViewAttribute(aliceApp, "incall_sound", "aria-checked");
+    const clickOn = await clickCallViewControl(aliceApp, "incall_sound");
+    await wait(500);
+    const afterOn = await getCallViewAttribute(aliceApp, "incall_sound", "aria-checked");
+    vocabulary.sound = {
+      clickOff,
+      clickOn,
+      before,
+      afterOff,
+      afterOn,
+      pass:
+        Boolean(clickOff?.ok && clickOff.value?.ok) &&
+        Boolean(clickOn?.ok && clickOn.value?.ok) &&
+        afterOff === "false" &&
+        afterOn === "true",
+    };
   }
 
   const pass = Object.values(vocabulary).every((entry) => entry.pass);
@@ -844,9 +821,8 @@ async function runWindowMoveReparenting(aliceApp, bobApp) {
   };
 }
 
-// M3 step 3 (design/m3-window-ux.md §3-3, desktop 実装は call-control-preload.cjs の
-// applyFooterVisibility()/main.cjs の pushCallViewFooterVisibility()): EC フッターの出し分け
-// (別窓=表示 / メイン埋め込み=非表示) を実 in-call UI で検証する。
+// Element Call's footer is the shared native call bar. It must remain visible
+// before, during, and after a WebContentsView reparent operation.
 //
 // 「popoutCallView()/popinCallView() で駆動する」という設計文書の記述に対し、この E2E は
 // windowMoveReparenting/boundsSync/callRespawn と同じ既存パターンに揃えて
@@ -879,12 +855,6 @@ const FOOTER_VISIBILITY_SCRIPT = `(() => {
 
 async function readFooterState(aliceApp) {
   return evalInCallView(aliceApp, FOOTER_VISIBILITY_SCRIPT);
-}
-
-function footerHiddenAsExpected(readResult) {
-  return Boolean(
-    readResult && readResult.ok && readResult.value && readResult.value.found && readResult.value.visibility === "hidden",
-  );
 }
 
 function footerVisibleAsExpected(readResult) {
@@ -920,10 +890,10 @@ async function runFooterVisibilityToggle(aliceApp) {
   // popinCallView() 相当 (see comment above -- same main.cjs code path).
   const attach = await aliceApp.evaluate(() => global.__selfmatrixE2E.attachCallView());
   const footerAfterAttach = await waitForCondition(
-    "footerVisibilityToggle.hiddenAfterAttach",
+    "footerVisibilityToggle.visibleAfterAttach",
     async () => {
       const read = await readFooterState(aliceApp);
-      return { ok: footerHiddenAsExpected(read), read };
+      return { ok: footerVisibleAsExpected(read), read };
     },
     10000,
     { log },
@@ -933,7 +903,7 @@ async function runFooterVisibilityToggle(aliceApp) {
 
   const pass =
     attachedBefore === "main" &&
-    footerHiddenAsExpected(footerAttached) &&
+    footerVisibleAsExpected(footerAttached) &&
     attachedAfterDetach === "window" &&
     footerAfterDetach.ok &&
     attachedAfterAttach === "main" &&
@@ -989,22 +959,19 @@ function livePcsStillLive(before, afterById) {
 // 「state ではなく実体から逆算」方針) が実際に "window"→"main" と遷移すること、(b) その間
 // RTCPeerConnection が 1 つも作り直されず (id 集合不変)、事前に connected だった PC が
 // connected を維持すること (無再接続) の両方を実測する。
-async function runRealPopoutPopinClick(aliceApp, alicePage) {
+async function runRealPopoutPopinClick(aliceApp) {
   const beforeSnapshot = await getMainProcessSnapshot(aliceApp);
   const attachedBefore = beforeSnapshot?.callViewAttachedTo ?? null;
   const pcsBefore = (await evalInCallView(aliceApp, PCS_SUMMARY_SCRIPT)).value ?? [];
   const liveBefore = pcsBefore.filter(isPcLive);
 
-  // 1. popout: `call_popout` ボタンを実クリック (placement==='main' の間はこの testid、
-  //    CallControls.tsx の popoutButtonTestId 参照)。
-  const popoutButtonVisible = await alicePage
-    .locator('[data-testid="call_popout"]')
-    .waitFor({ state: "visible", timeout: 10000 })
-    .then(() => true)
-    .catch(() => false);
-  if (popoutButtonVisible) {
-    await alicePage.locator('[data-testid="call_popout"]').click();
-  }
+  // 1. Click the shared footer's native popout button.
+  const popoutButtonVisible =
+    (await getCallViewAttribute(aliceApp, "native_call_popout", "data-testid")) ===
+    "native_call_popout";
+  const popoutClick = popoutButtonVisible
+    ? await clickCallViewControl(aliceApp, "native_call_popout")
+    : null;
 
   const afterPopout = await waitForCondition(
     "realPopoutPopinClick.attachedToWindow",
@@ -1022,16 +989,53 @@ async function runRealPopoutPopinClick(aliceApp, alicePage) {
     new Map(pcsAfterPopout.map((pc) => [pc.id, pc])),
   );
 
-  // 2. popin: 別窓へ移った後は同じボタン位置の testid が `call_popin` に切り替わる
-  //    (nativePopin === true、CallControls.tsx 参照) -- それを実クリックしてメインへ戻す。
-  const popinButtonVisible = await alicePage
-    .locator('[data-testid="call_popin"]')
-    .waitFor({ state: "visible", timeout: 10000 })
-    .then(() => true)
-    .catch(() => false);
-  if (popinButtonVisible) {
-    await alicePage.locator('[data-testid="call_popin"]').click();
-  }
+  const pinBefore = await getCallViewAttribute(aliceApp, "native_call_pin", "aria-pressed");
+  const pinClick = await clickCallViewControl(aliceApp, "native_call_pin");
+  await wait(400);
+  const pinAfter = await getCallViewAttribute(aliceApp, "native_call_pin", "aria-pressed");
+  const pinRestoreClick = await clickCallViewControl(aliceApp, "native_call_pin");
+  await wait(400);
+  const pinRestored = await getCallViewAttribute(aliceApp, "native_call_pin", "aria-pressed");
+
+  const fullscreenBefore = await getCallViewAttribute(
+    aliceApp,
+    "native_call_fullscreen",
+    "aria-pressed",
+  );
+  const fullscreenClick = await clickCallViewControl(aliceApp, "native_call_fullscreen");
+  await wait(800);
+  const fullscreenAfter = await getCallViewAttribute(
+    aliceApp,
+    "native_call_fullscreen",
+    "aria-pressed",
+  );
+  const fullscreenRestoreClick = await clickCallViewControl(
+    aliceApp,
+    "native_call_fullscreen",
+  );
+  await wait(800);
+  const fullscreenRestored = await getCallViewAttribute(
+    aliceApp,
+    "native_call_fullscreen",
+    "aria-pressed",
+  );
+  const windowControlsPass =
+    Boolean(pinClick?.ok && pinClick.value?.ok) &&
+    Boolean(pinRestoreClick?.ok && pinRestoreClick.value?.ok) &&
+    pinAfter !== pinBefore &&
+    pinRestored === pinBefore &&
+    Boolean(fullscreenClick?.ok && fullscreenClick.value?.ok) &&
+    Boolean(fullscreenRestoreClick?.ok && fullscreenRestoreClick.value?.ok) &&
+    fullscreenAfter !== fullscreenBefore &&
+    fullscreenRestored === fullscreenBefore;
+
+  // 2. The same footer now exposes the explicit return-to-SelfMatrix action.
+  const popinButtonVisible =
+    (await getCallViewAttribute(aliceApp, "native_call_popin", "data-testid")) ===
+    "native_call_popin";
+  const popinClick = popinButtonVisible
+    ? await clickCallViewControl(aliceApp, "native_call_popin")
+    : null;
 
   const afterPopin = await waitForCondition(
     "realPopoutPopinClick.attachedToMain",
@@ -1052,10 +1056,13 @@ async function runRealPopoutPopinClick(aliceApp, alicePage) {
   const pass =
     attachedBefore === "main" &&
     popoutButtonVisible &&
+    Boolean(popoutClick?.ok && popoutClick.value?.ok) &&
     afterPopout.ok &&
     noReconnectAfterPopout &&
     stillConnectedAfterPopout &&
+    windowControlsPass &&
     popinButtonVisible &&
+    Boolean(popinClick?.ok && popinClick.value?.ok) &&
     afterPopin.ok &&
     noReconnectAfterPopin &&
     stillConnectedAfterPopin;
@@ -1063,10 +1070,21 @@ async function runRealPopoutPopinClick(aliceApp, alicePage) {
   return {
     attachedBefore,
     popoutButtonVisible,
+    popoutClick,
     attachedAfterPopout: afterPopout.attachedTo,
     noReconnectAfterPopout,
     stillConnectedAfterPopout,
+    windowControls: {
+      pinBefore,
+      pinAfter,
+      pinRestored,
+      fullscreenBefore,
+      fullscreenAfter,
+      fullscreenRestored,
+      pass: windowControlsPass,
+    },
     popinButtonVisible,
+    popinClick,
     attachedAfterPopin: afterPopin.attachedTo,
     noReconnectAfterPopin,
     stillConnectedAfterPopin,
@@ -1257,29 +1275,23 @@ async function verifyLocalStorageContract(aliceApp) {
 // 720/30 とは異なる組み合わせ (1080/15) を選ぶ。
 const MID_CALL_SETTINGS_SYNC_VALUES = { quality: "1080", fps: 15 };
 
-async function verifyMidCallSettingsSync(alicePage, aliceApp) {
-  const screenshareButton = alicePage.locator('[data-testid="call_control_screenshare"]');
-
-  // 1. 一旦オフにする (enabled=true の状態でクリックすると即座に toggle、ピッカーは開かない)。
-  await screenshareButton.click();
+async function verifyMidCallSettingsSync(_alicePage, aliceApp) {
+  // 1. Stop the active share using the shared Element Call footer.
+  await clickCallViewControl(aliceApp, "incall_screenshare");
   await wait(1000);
-  const afterOff = await screenshareButton.getAttribute("aria-pressed").catch(() => null);
+  const afterOff = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
 
-  // 2. 再度クリックしてピッカーを開き、既存の値 (720/30, primeLocalStorageBeforeJoin() 参照) とは
-  //    異なる quality/fps を選んでから「配信を開始」する。ss_start の onClick
-  //    (Controls.tsx handleStartShare) が setScreenShareQuality/setScreenShareFps で cinny 自身の
-  //    localStorage に書き込んだ **直後**に onToggle() = NativeCallControl.toggleScreenshare() を
-  //    呼ぶ -- これが H3 の live 再同期を実際にトリガーする実クリックパス。
-  await screenshareButton.click();
-  await alicePage.locator(`[data-testid="ssq_${MID_CALL_SETTINGS_SYNC_VALUES.quality}"]`).click();
-  await alicePage.locator(`[data-testid="ssf_${MID_CALL_SETTINGS_SYNC_VALUES.fps}"]`).click();
-  await alicePage.locator('[data-testid="ss_start"]').click();
-  // M2 画面共有ソース選択 UI: この「配信を開始」クリックが新しい getDisplayMedia() 要求を起こし、
-  // 実ピッカーが開く (バイパスしない) -- 選ばないと getDisplayMedia が解決せず afterOn が
-  // 永遠に反転しないため、ここで実際に操作する。
+  // 2. Change quality/FPS in the same footer, then start a fresh share.
+  await clickCallViewControl(aliceApp, "screenshare_options");
+  await clickCallViewControl(
+    aliceApp,
+    `ss_quality_${MID_CALL_SETTINGS_SYNC_VALUES.quality}`,
+  );
+  await clickCallViewControl(aliceApp, `ss_fps_${MID_CALL_SETTINGS_SYNC_VALUES.fps}`);
+  await clickCallViewControl(aliceApp, "incall_screenshare");
   const midCallPicker = await driveSourcePicker(aliceApp, { log }, { includeSystemAudio: true });
   await wait(1500);
-  const afterOn = await screenshareButton.getAttribute("aria-pressed").catch(() => null);
+  const afterOn = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
 
   const readBack = await evalInCallView(
     aliceApp,
@@ -1295,19 +1307,15 @@ async function verifyMidCallSettingsSync(alicePage, aliceApp) {
     readBack.value?.fps === JSON.stringify(MID_CALL_SETTINGS_SYNC_VALUES.fps);
 
   return {
-    writtenInCinny: MID_CALL_SETTINGS_SYNC_VALUES,
+    writtenInCallView: MID_CALL_SETTINGS_SYNC_VALUES,
     afterOff,
     afterOn,
     readBackFromCallView: readBack,
     midCallPicker,
     note:
-      "Drives cinny's own ScreenShareButton + quality/fps picker (Controls.tsx) via real clicks on " +
-      "alicePage, so this actually exercises NativeCallControl.toggleScreenshare()'s live resync " +
-      "(collectNativeCallLocalStorageSnapshot() -> transport.updateCallLocalStorage(), awaited " +
-      "before the callControlInvoke() RPC click) -- unlike runCallControlVocabulary()'s " +
-      "toggleScreenshare check, which bypasses cinny's TS layer entirely via " +
-      "global.__selfmatrixE2E.invokeCallControl(). M2: the re-share click above opens the native " +
-      "source picker (registerDisplayMediaHandler()) -- driveSourcePicker() drives it for real.",
+      "Drives the production Element Call screen-share menu used in both native placements. " +
+      "The setting and getDisplayMedia call now live in one renderer, eliminating the old " +
+      "Cinny-to-call-view timing dependency while still exercising the native source picker.",
     pass:
       afterOff === "false" &&
       afterOn === "true" &&
@@ -1348,7 +1356,7 @@ async function runCallRespawn(aliceApp, alicePage) {
     registrationBeforeSnapshot?.callViewPreloadRegistrationCount ?? null;
 
   // 1. alice 自身の切断ボタン (実クリック) で退出する。
-  await alicePage.locator('[data-testid="call_hangup"]').click();
+  await clickCallViewControl(aliceApp, "incall_leave");
 
   const callViewClosed = await waitForCondition(
     "callRespawn.callViewClosed",
@@ -1423,23 +1431,23 @@ async function runCallRespawn(aliceApp, alicePage) {
   // 4. screenshare が実クリックで 1 回だけ反転する (二重リスナー回帰の検知)。
   let screenshareSingleToggle = { pass: false, reason: "not_in_call" };
   if (rejoinInCall.pass) {
-    const before = await getDomAriaPressed(alicePage, "call_control_screenshare");
+    const before = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
     const t0 = Date.now();
-    await alicePage.locator('[data-testid="call_control_screenshare"]').click();
-    await alicePage.locator('[data-testid="ssq_720"]').click();
-    await alicePage.locator('[data-testid="ssf_30"]').click();
-    await alicePage.locator('[data-testid="ss_start"]').click();
+    await clickCallViewControl(aliceApp, "screenshare_options");
+    await clickCallViewControl(aliceApp, "ss_quality_720");
+    await clickCallViewControl(aliceApp, "ss_fps_30");
+    await clickCallViewControl(aliceApp, "incall_screenshare");
     // M2 画面共有ソース選択 UI: 通話跨ぎ後の再共有もネイティブピッカーを実際に経由する
     // (バイパスしない -- 選ばないと getDisplayMedia が解決せず after が反転しない)。
     const respawnPicker = await driveSourcePicker(aliceApp, { log }, { includeSystemAudio: true });
     await wait(1500);
-    const after = await getDomAriaPressed(alicePage, "call_control_screenshare");
+    const after = await getCallViewAttribute(aliceApp, "incall_screenshare", "aria-checked");
     const snapshot = await getMainProcessSnapshot(aliceApp);
     const pushesSinceClick = (snapshot?.callControlMessages ?? []).filter(
       (m) =>
         m.direction === "state-push" &&
         m.kind === "call-control" &&
-        m.reason === "action-toggleScreenshare" &&
+        m.screenshare === true &&
         m.t >= t0,
     );
     screenshareSingleToggle = {
@@ -1572,33 +1580,28 @@ async function runBoundsSync(aliceApp, alicePage) {
   await wait(500);
   boundsSync.afterWindowResize = await waitForBoundsMatch(aliceApp, alicePage, "afterWindowResize");
 
-  // 3. cinny 側 UI でレイアウトが変わる操作 (チャットパネル開閉、実クリック)。
-  await alicePage.locator('[data-testid="call_control_chat"]').click();
+  // 3. A second real window resize confirms repeated layout updates, without
+  // relying on the removed duplicate call-chat button.
+  const secondResizeOutcome = await aliceApp.evaluate(() =>
+    global.__selfmatrixE2E.resizeMainWindow(1250, 740),
+  );
+  boundsSync.secondResizeInvoked = secondResizeOutcome;
   await wait(500);
-  boundsSync.afterChatOpen = await waitForBoundsMatch(aliceApp, alicePage, "afterChatOpen");
-  // 後始末: 他のステップ (localStorageContract 等) に影響しないよう閉じておく。
-  await alicePage.locator('[data-testid="call_control_chat"]').click();
-  await wait(500);
-  boundsSync.afterChatClose = await waitForBoundsMatch(aliceApp, alicePage, "afterChatClose");
+  boundsSync.afterSecondResize = await waitForBoundsMatch(
+    aliceApp,
+    alicePage,
+    "afterSecondResize",
+  );
 
-  // 4. detach (別窓) 中に実際に push させ、shell 側が「attached でない」として無視することを
-  //    確認する。detach/attach は shell 内部の WebContentsView 再親子付けにのみ影響し、cinny
-  //    自身の描画 (mainWindow の top frame そのもの) には一切影響しない (attach/detach 自体は
-  //    cinny の DOM から不可視) -- そのため cinny の ResizeObserver は「reattach したこと」
-  //    単体では再発火せず、cinny は reattach のタイミングで自発的に再 push しない。この現状の
-  //    アーキテクチャの下で意味のある形で「attach 復帰後の再一致」を検証するため、detach 中は
-  //    チャットパネルを開いてから (実レイアウト変化 → push → shell 側で無視される) 同じ操作で
-  //    再び閉じ (detach 前と正味同じレイアウトに戻す) てから reattach する。popout 自体は M3
-  //    スコープで native はまだ提供していない (useCallPopout の hasSelfmatrixNativeBridge
-  //    ガード参照) ため、「detach 中にウィンドウサイズを変えたまま reattach した瞬間に正しい
-  //    位置へ飛ぶ」までは現時点のスコープ外 (nativeBridge.ts の setCallViewBounds() 契約コメント
-  //    「detached 中の別窓のレイアウトは callWindow 側の責務」参照)。
+  // 4. Main-window bounds updates are intentionally ignored while the call
+  // view belongs to the popout. Resize twice to exercise that production path
+  // while restoring the same main layout before reattaching.
   const beforeDetachLogLen = (await getMainProcessSnapshot(aliceApp))?.callViewBoundsApplyLog?.length ?? 0;
   await aliceApp.evaluate(() => global.__selfmatrixE2E.detachCallView());
   await wait(REPARENT_SETTLE_MS);
-  await alicePage.locator('[data-testid="call_control_chat"]').click(); // open, while detached
+  await aliceApp.evaluate(() => global.__selfmatrixE2E.resizeMainWindow(1000, 650));
   await wait(500);
-  await alicePage.locator('[data-testid="call_control_chat"]').click(); // close again, while detached
+  await aliceApp.evaluate(() => global.__selfmatrixE2E.resizeMainWindow(1250, 740));
   await wait(500);
   const duringDetachSnapshot = await getMainProcessSnapshot(aliceApp);
   const duringDetachLog = (duringDetachSnapshot?.callViewBoundsApplyLog ?? []).slice(beforeDetachLogLen);
@@ -1620,8 +1623,7 @@ async function runBoundsSync(aliceApp, alicePage) {
   const pass =
     boundsSync.initial.ok &&
     boundsSync.afterWindowResize.ok &&
-    boundsSync.afterChatOpen.ok &&
-    boundsSync.afterChatClose.ok &&
+    boundsSync.afterSecondResize.ok &&
     boundsSync.duringDetach.ignoredWhileDetached &&
     boundsSync.afterReattach.ok &&
     boundsSync.afterWindowRestore.ok;
@@ -1790,25 +1792,21 @@ async function main() {
         `allRoundTripsActuallyMoved=${windowMove.allRoundTripsActuallyMoved}`,
     );
 
-    // ---- 8.5. M3 step 3: EC フッターの出し分け (別窓=表示 / メイン埋め込み=非表示) を実 in-call
-    //           UI に対して検証する。windowMoveReparenting の直後 (call view は "main" に attached
-    //           で終わる) に行う。--------------------------------------------------------------
+    // ---- 8.5. The shared Element Call call bar stays visible across reparenting. -----------------
     const footerVisibilityToggle = await runFooterVisibilityToggle(aliceApp);
     result.passConditions.footerVisibilityToggle = footerVisibilityToggle;
     log(
       `footerVisibilityToggle: attachedBefore=${footerVisibilityToggle.attachedBefore} ` +
-        `hiddenBefore=${footerHiddenAsExpected(footerVisibilityToggle.footerWhileAttachedBefore)} ` +
+        `visibleBefore=${footerVisibleAsExpected(footerVisibilityToggle.footerWhileAttachedBefore)} ` +
         `attachedAfterDetach=${footerVisibilityToggle.attachedAfterDetach} ` +
         `visibleWhileDetached=${footerVisibleAsExpected(footerVisibilityToggle.footerWhileDetached)} ` +
         `attachedAfterAttach=${footerVisibilityToggle.attachedAfterAttach} ` +
-        `hiddenAfterReattach=${footerHiddenAsExpected(footerVisibilityToggle.footerWhileAttachedAfter)} ` +
+        `visibleAfterReattach=${footerVisibleAsExpected(footerVisibilityToggle.footerWhileAttachedAfter)} ` +
         `pass=${footerVisibilityToggle.pass}`,
     );
 
-    // ---- 8.6 SelfMatrix M3 step 5 (M3 の受け入れ条件そのもの): cinny 自身の実 ⧉ ボタンを実クリック
-    //          しての popout/popin (production 配線検証)。footerVisibilityToggle 直後 (call view は
-    //          "main" に attached で終わる) に行う。---------------------------------------------
-    const realPopoutPopinClick = await runRealPopoutPopinClick(aliceApp, alicePage);
+    // ---- 8.6 Shared footer window controls: popout/pin/fullscreen/popin. --------------------------
+    const realPopoutPopinClick = await runRealPopoutPopinClick(aliceApp);
     result.passConditions.realPopoutPopinClick = realPopoutPopinClick;
     log(
       `realPopoutPopinClick: attachedBefore=${realPopoutPopinClick.attachedBefore} ` +

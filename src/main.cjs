@@ -1730,19 +1730,42 @@ function pushCallViewPlacement() {
   if (state.mainWindow && !state.mainWindow.isDestroyed()) {
     state.mainWindow.webContents.send("native:call-view-placement", placement);
   }
+  pushCallWindowUiState();
 }
 
-// M3 step 3 (design/m3-window-ux.md §3-3): EC フッターの出し分け (別窓=表示 / メイン埋め込み=
-// 非表示、Discord 準拠)。pushCallViewPlacement() (mainWindow/cinny 宛て) とは受け手が異なる別
-// チャンネル -- こちらは call view (EC) 自身の call-control-preload.cjs 宛て
-// (native:set-footer-visible、call-control-preload.cjs 冒頭のフッター節参照)。call view が
-// 無い/破棄済みなら何もしない (次に openCallView() が新しい call view を作った際は
-// call-control-preload.cjs 側の既定値 (footerVisible=false=hidden) が「常に attached から
-// 始まる」invariant と一致しているため、push を取りこぼしても見え方は食い違わない)。
+// Element Call の通話バーを main / popout の共通 UI として使う。通話 View が生存している間は
+// attach 先にかかわらず表示し、Cinny 側の重複バーは native ビルドで描画しない。
 function pushCallViewFooterVisibility() {
   if (!state.callView || state.callView.webContents.isDestroyed()) return;
-  const visible = state.callViewState === "detached";
+  const visible = state.callViewState === "attached" || state.callViewState === "detached";
   state.callView.webContents.send("native:set-footer-visible", visible);
+}
+
+function callWindowUiState() {
+  const placement = computeCallViewAttachedTo();
+  const callWindow = state.callWindow;
+  const liveWindow = callWindow && !callWindow.isDestroyed() ? callWindow : null;
+  return {
+    placement,
+    // The persisted preference is the product state. On Windows,
+    // BrowserWindow.isAlwaysOnTop() can lag immediately after setAlwaysOnTop(),
+    // which would otherwise make the pressed state flash back to its old value.
+    alwaysOnTop: loadCallWindowAlwaysOnTopEnabled(),
+    fullScreen: placement === "window" && liveWindow ? liveWindow.isFullScreen() : false,
+  };
+}
+
+function pushCallWindowUiState() {
+  if (!state.callView || state.callView.webContents.isDestroyed()) return;
+  state.callView.webContents.send("native:call-window-state", callWindowUiState());
+}
+
+function isCurrentCallViewMainFrame(event) {
+  if (!state.callView || state.callView.webContents.isDestroyed()) return false;
+  return (
+    event.sender.id === state.callView.webContents.id &&
+    event.senderFrame === event.sender.mainFrame
+  );
 }
 
 // M3 step 0 スパイク (design/m3-window-ux.md §3-1): 別窓を**ユーザーが実際に閉じた**ときの挙動。
@@ -1800,6 +1823,8 @@ function createCallWindow(options = {}) {
   // state.callWindow = null にする、下記コメント参照) ので、生成時点で毎回読み直さないと 2 回目
   // 以降の別窓に設定が引き継がれない。mainWindow には適用しない (この設定は callWindow 専用)。
   win.setAlwaysOnTop(loadCallWindowAlwaysOnTopEnabled());
+  win.on("enter-full-screen", () => pushCallWindowUiState());
+  win.on("leave-full-screen", () => pushCallWindowUiState());
   win.on("resize", () => {
     updateCallViewBounds();
     if (!win.isDestroyed()) saveCallWindowState(win.getBounds());
@@ -2021,6 +2046,13 @@ function toggleCallWindowAlwaysOnTop() {
   if (state.callWindow && !state.callWindow.isDestroyed()) {
     state.callWindow.setAlwaysOnTop(next);
   }
+  pushCallWindowUiState();
+}
+
+function toggleCallWindowFullscreen() {
+  if (!state.callWindow || state.callWindow.isDestroyed()) return;
+  state.callWindow.setFullScreen(!state.callWindow.isFullScreen());
+  pushCallWindowUiState();
 }
 
 const CALL_WINDOW_ALWAYS_ON_TOP_MENU_LABEL = "通話の別窓を最前面に固定";
@@ -2361,14 +2393,11 @@ async function openCallView(url, localStorageSnapshot) {
 
   createCallViewIfNeeded();
   await state.callView.webContents.loadURL(url);
-  // M3 step 3 (design §3 step 3 実装要件 2「openCallView 直後 (通話開始 = attached) は非表示で
-  // 初期化」): createCallViewIfNeeded() は call view を必ずまず mainWindow へ addChildView() する
-  // (常に attached から始まる) ので、ロード完了後に明示的に push しておく。loadURL() の resolve を
-  // 待ってから送る -- call-control-preload.cjs の ipcRenderer.on("native:set-footer-visible", ...)
-  // 登録 (トップレベル、preload 実行時) は loadURL() 解決より確実に前に完了しているため、この push
-  // は確実に受信される (push 前の一瞬でも既定値 footerVisible=false と一致するため、万一取りこぼしても
-  // 見え方は食い違わない)。
+  // The Element Call footer is the native product's shared call bar in both
+  // placements. Push after load so the preload has installed its listener and
+  // the initial attached view cannot inherit stale visibility state.
   pushCallViewFooterVisibility();
+  pushCallWindowUiState();
 }
 
 // H3 (受け入れレビュー修正、major): 「共有開始時に再同期」する live localStorage 契約。
@@ -2582,7 +2611,7 @@ async function detachCallView(options = {}) {
     // 直接呼び出し経由でも、この関数を通る限り必ず push する — 呼び出し元を区別しない (design §3-5
     // のとおり cinny 側は「実際にどこへ動いたか」だけを知る必要がある)。
     pushCallViewPlacement();
-    // M3 step 3: 別窓へ移った (detached) ので EC 自身のフッターを表示に切り替える。
+    // Keep the shared Element Call call bar visible after reparenting.
     pushCallViewFooterVisibility();
   }
 }
@@ -2607,11 +2636,22 @@ async function attachCallView() {
     // ユーザーが別窓を X ボタンで閉じた場合の「勝手な attach」もここから自動的に push される
     // (design §3-5 の核心 — cinny 側は明示的に何も呼んでいないのに main 側で状態が変わるケース)。
     pushCallViewPlacement();
-    // M3 step 3: メインへ戻った (attached) ので EC 自身のフッターを非表示に切り替える (cinny 側
-    // バーで操作する通常状態に戻す)。close=復帰 (createCallWindow() の "close" ハンドラ) 経由でも
-    // この関数を通るため、ユーザーが別窓を X ボタンで閉じた場合も自動的にフッターが隠れる。
+    // Keep the same call bar visible after returning to the main window.
     pushCallViewFooterVisibility();
   }
+}
+
+// Explicit "return to SelfMatrix" closes the now-empty popout after moving the
+// same WebContentsView back to main. The window-close recovery path keeps using
+// attachCallView() directly because its own close handler performs destruction.
+async function popinCallViewAndCloseWindow() {
+  const callWindow = state.callWindow;
+  await attachCallView();
+  if (callWindow && !callWindow.isDestroyed()) {
+    state.callWindow = null;
+    callWindow.destroy();
+  }
+  pushCallWindowUiState();
 }
 
 // H1 (受け入れレビュー修正、major): detachCallView()/attachCallView() が「実際に窓を移動させた」
@@ -2859,7 +2899,48 @@ function setupIpc() {
   // 常に closeMode を省略する」という createCallWindow() のコメントどおり、ここでも options なしで
   // 呼ぶ (= 常に close-preserve)。
   ipcMain.handle("native:popout-call-view", () => detachCallView());
-  ipcMain.handle("native:popin-call-view", () => attachCallView());
+  ipcMain.handle("native:popin-call-view", () => popinCallViewAndCloseWindow());
+
+  // Element Call の共通通話バーにだけ公開する、別窓操作の狭い API。登録 preload は同じ
+  // partition の子 frame にも入るため、送信元 WebContents だけでなく main frame であることも
+  // 検証し、埋め込みコンテンツからの窓操作を拒否する。
+  ipcMain.handle("native:get-call-window-state", (event) => {
+    if (!isCurrentCallViewMainFrame(event)) {
+      throw new Error("native:get-call-window-state: rejected sender");
+    }
+    return callWindowUiState();
+  });
+  ipcMain.handle("native:call-window-action", async (event, action) => {
+    if (!isCurrentCallViewMainFrame(event)) {
+      throw new Error("native:call-window-action: rejected sender");
+    }
+
+    switch (action) {
+      case "popout":
+        await detachCallView();
+        break;
+      case "popin":
+        await popinCallViewAndCloseWindow();
+        break;
+      case "toggleAlwaysOnTop":
+        if (state.callViewState !== "detached") {
+          throw new Error("native:call-window-action: call is not popped out");
+        }
+        toggleCallWindowAlwaysOnTop();
+        break;
+      case "toggleFullscreen":
+        if (state.callViewState !== "detached") {
+          throw new Error("native:call-window-action: call is not popped out");
+        }
+        toggleCallWindowFullscreen();
+        break;
+      default:
+        throw new Error("native:call-window-action: unknown action");
+    }
+
+    pushCallWindowUiState();
+    return callWindowUiState();
+  });
 
   // M1 step 3c-2 (localStorage 契約の実機対応、README「cinny の nativeBridge.ts 契約への適合」
   // 節参照): call-control-preload.cjs が dom-ready より前 (preload 実行時) に同期的に読み出す
@@ -3913,8 +3994,8 @@ async function runCinnyShellSmoke() {
   // transport.callControlInvoke() で invoke する。このプロトタイプにはバックエンドが無く、
   // EC は ErrorView (Room not found) しか描画しないため in-call UI (screenshare/spotlight/
   // emphasis/reactions/settings) は存在しない — そのため DOM action は例外を投げず
-  // `{ok:false, reason:"target_not_found"}` を返す。sound は相手が 0 人でも状態を保持する契約なので
-  // audioCount:0 の `{ok:true}` を返すのが正しい。
+  // `{ok:false, reason:"target_not_found"}` を返す。sound は UI がまだ無くても希望状態を保持する
+  // 契約なので controlFound:false の `{ok:true}` を返すのが正しい。
   // call-control-preload.cjs の switch 分岐からその action の case が抜け落ちると default 節
   // (`{ok:false, reason:"unknown_action"}`) に落ちるため、reason が "unknown_action" になった
   // 場合は語彙の欠落 (=cinny 側の契約を満たしていない) と判定して FAIL にする。例外/タイムアウト
@@ -3944,7 +4025,7 @@ async function runCinnyShellSmoke() {
         outcome.error === null &&
         Boolean(outcome.result) &&
         (isSoundAction
-          ? outcome.result.ok === true && outcome.result.audioCount === 0
+          ? outcome.result.ok === true && outcome.result.controlFound === false
           : outcome.result.ok === false && reason === "target_not_found"),
     };
   }
@@ -5390,6 +5471,109 @@ async function runM3WindowProbe() {
     };
     if (!steps.initialConnect.pass) return await finishM3WindowProbe(steps, "initial-connect-failed");
     const loadMarkerInitial = initialConnect.loadMarker;
+
+    // 1.5. Element Call の production preload が公開する狭い別窓 API を実 renderer から通す。
+    //      transport 互換経路だけでは、共通通話バーが実際に使う contextBridge / sender 検証 /
+    //      明示 popin 時の空 BrowserWindow 破棄を検証できないため、同じ RTC loopback を保ったまま
+    //      popout -> pin 往復 -> popin を一度行う。
+    const bridgeInitialState = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow
+        ? window.selfmatrixCallWindow.getState()
+            .then((value) => ({ ok: true, value }))
+            .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))
+        : Promise.resolve({ ok: false, error: "bridge_missing" })`,
+      true,
+    );
+    const bridgePopoutResult = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow.popout()
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const bridgeWindow = state.callWindow;
+    const bridgePinBefore =
+      bridgeWindow && !bridgeWindow.isDestroyed() ? bridgeWindow.isAlwaysOnTop() : null;
+    const bridgePinFirst = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow.toggleAlwaysOnTop()
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const bridgePinAfterFirst =
+      bridgeWindow && !bridgeWindow.isDestroyed() ? bridgeWindow.isAlwaysOnTop() : null;
+    const bridgePinSecond = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow.toggleAlwaysOnTop()
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    await wait(300);
+    const bridgePinAfterSecond =
+      bridgeWindow && !bridgeWindow.isDestroyed() ? bridgeWindow.isAlwaysOnTop() : null;
+    const bridgeAfterPopout = await readM3SpikeState(state.callView);
+    const bridgeWindowBeforePopin = state.callWindow;
+    const bridgePopinResult = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow.popin()
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    const bridgeWindowDestroyed = await waitForM3SpikeCondition(
+      () => !bridgeWindowBeforePopin || bridgeWindowBeforePopin.isDestroyed(),
+      8000,
+    );
+    await wait(300);
+    const bridgeFinalState = await state.callView.webContents.executeJavaScript(
+      `window.selfmatrixCallWindow.getState()
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error: String(error && error.message ? error.message : error) }))`,
+      true,
+    );
+    const bridgeAfterPopin = await readM3SpikeState(state.callView);
+    steps.callWindowBridge = {
+      initialState: bridgeInitialState,
+      popoutResult: bridgePopoutResult,
+      pinBefore: bridgePinBefore,
+      pinFirst: bridgePinFirst,
+      pinAfterFirst: bridgePinAfterFirst,
+      pinSecond: bridgePinSecond,
+      pinAfterSecond: bridgePinAfterSecond,
+      popinResult: bridgePopinResult,
+      windowDestroyed: bridgeWindowDestroyed,
+      finalState: bridgeFinalState,
+      attachedTo: computeCallViewAttachedTo(),
+      webContentsId: state.callView.webContents.id,
+      connectedAfterPopout: Boolean(bridgeAfterPopout.ok && bridgeAfterPopout.connected),
+      connectedAfterPopin: Boolean(bridgeAfterPopin.ok && bridgeAfterPopin.connected),
+      loadMarkerAfterPopout: bridgeAfterPopout.loadMarker,
+      loadMarkerAfterPopin: bridgeAfterPopin.loadMarker,
+      pass:
+        bridgeInitialState.ok === true &&
+        bridgeInitialState.value?.placement === "main" &&
+        bridgePopoutResult.ok === true &&
+        bridgePopoutResult.value?.placement === "window" &&
+        Boolean(bridgeWindow) &&
+        Boolean(bridgeAfterPopout.ok && bridgeAfterPopout.connected) &&
+        bridgeAfterPopout.loadMarker === loadMarkerInitial &&
+        bridgePinFirst.ok === true &&
+        bridgePinFirst.value?.alwaysOnTop === !bridgePinBefore &&
+        bridgePinSecond.ok === true &&
+        bridgePinSecond.value?.alwaysOnTop === bridgePinBefore &&
+        bridgePopinResult.ok === true &&
+        bridgePopinResult.value?.placement === "main" &&
+        bridgeWindowDestroyed === true &&
+        bridgeFinalState.ok === true &&
+        bridgeFinalState.value?.placement === "main" &&
+        computeCallViewAttachedTo() === "main" &&
+        state.callView.webContents.id === webContentsIdInitial &&
+        Boolean(bridgeAfterPopin.ok && bridgeAfterPopin.connected) &&
+        bridgeAfterPopin.loadMarker === loadMarkerInitial,
+    };
+    if (!steps.callWindowBridge.pass) {
+      return await finishM3WindowProbe(steps, "call-window-bridge-step-failed");
+    }
 
     // 2. popoutCallView() (契約 → IPC → detachCallView()、既定 = close-preserve): 無再接続で別窓へ。
     const popoutResult = await win.webContents.executeJavaScript(

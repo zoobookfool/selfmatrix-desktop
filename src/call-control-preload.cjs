@@ -42,7 +42,25 @@
 // 完全に独立したコードパスで、cinny-shell smoke の onCallControlState 配線確認にも引き続き使う
 // (この環境で唯一実在する操作可能ターゲットのため)。
 
-const { ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer } = require("electron");
+
+// Trusted desktop-only controls consumed by Element Call's shared footer. The
+// page receives explicit operations rather than raw ipcRenderer access.
+contextBridge.exposeInMainWorld("selfmatrixCallWindow", {
+  getState: () => ipcRenderer.invoke("native:get-call-window-state"),
+  popout: () => ipcRenderer.invoke("native:call-window-action", "popout"),
+  popin: () => ipcRenderer.invoke("native:call-window-action", "popin"),
+  toggleAlwaysOnTop: () =>
+    ipcRenderer.invoke("native:call-window-action", "toggleAlwaysOnTop"),
+  toggleFullscreen: () =>
+    ipcRenderer.invoke("native:call-window-action", "toggleFullscreen"),
+  onStateChange: (listener) => {
+    if (typeof listener !== "function") return () => {};
+    const handler = (_event, nextState) => listener(nextState);
+    ipcRenderer.on("native:call-window-state", handler);
+    return () => ipcRenderer.removeListener("native:call-window-state", handler);
+  },
+});
 
 // M1 step 3c-2 (localStorage 契約の実機対応、README「cinny の nativeBridge.ts 契約への適合」節
 // 参照): call view (EC) は mainWindow (cinny) とは別の session partition (CALL_VIEW_PARTITION)
@@ -118,6 +136,7 @@ const TARGET_SELECTOR = '[role="button"][data-kind="primary"]';
 // CallControl.ts (src/app/plugins/call/CallControl.ts) と同一のセレクタ文字列。
 const SCREENSHARE_SELECTOR = '[data-testid="incall_screenshare"]';
 const LEAVE_SELECTOR = '[data-testid="incall_leave"]';
+const SOUND_SELECTOR = '[data-testid="incall_sound"]';
 const SPOTLIGHT_SELECTOR = 'input[value="spotlight"]';
 const GRID_SELECTOR = 'input[value="grid"]';
 const EMPHASIS_SELECTOR = '[data-testid="emphasis_toggle"]';
@@ -185,6 +204,10 @@ function leaveButton() {
   return document.querySelector(LEAVE_SELECTOR);
 }
 
+function soundButton() {
+  return document.querySelector(SOUND_SELECTOR);
+}
+
 // M1 step 3c-3 (受け入れレビューで発覚、修正): web 版 CallControl.ts と同じ
 // `leaveButton().previousElementSibling` ヒューリスティックを移植したが、この EC ビルド
 // (element-call/src/components/CallFooter.tsx — SelfMatrix fork でリファクタ済み) の実 DOM を
@@ -234,16 +257,14 @@ function footerElement() {
   return leave && leave.parentElement ? leave.parentElement.parentElement : null;
 }
 
-// main から push される「今フッターを見せるべきか」(design §3-3: attached (メイン埋め込み)=false/
-// hidden, detached (別窓)=true/visible)。既定は false -- 新規に作られる call view は
-// createCallViewIfNeeded() が必ずまず mainWindow へ addChildView() する (常に attached から始まる)
-// ため、この既定値は「push がまだ届いていない最初の一瞬」でも実際の attached 状態と食い違わない。
+// main から push される「今フッターを見せるべきか」。Element Call のフッターを main / popout
+// 共通の操作面として使うため、通話 View の既定は visible。
 // フッター自体が実 DOM に現れるのは通話参加後しばらく経ってから (LiveKit 接続後) なので、
 // localStorage 契約 (primeLocalStorageFromShell()) のような sendSync 版の pending 値取得は不要
 // -- top-level で登録済みの ipcRenderer.on("native:set-footer-visible", ...) が確実にその出現より
 // 先に (少なくとも同じくらい早く) 届く。
-let footerVisible = false;
-let desiredSoundOn = true;
+let footerVisible = true;
+let desiredSoundOn = null;
 
 // 元実装: CallControl.ts の onBodyMutation() のフッター部分。hidden 時は web 版と同一の
 // position:absolute + visibility:hidden (隠れている間はレイアウト上の場所を取らない)。visible 時は
@@ -263,13 +284,22 @@ function applyFooterVisibility() {
   }
 }
 
-function applyDesiredSound() {
-  const audios = document.querySelectorAll("audio");
-  audios.forEach((el) => {
-    // eslint-disable-next-line no-param-reassign
-    el.muted = !desiredSoundOn;
-  });
-  return audios.length;
+function readSoundControlState() {
+  const control = soundButton();
+  if (!control) return null;
+  return control.getAttribute("aria-checked") === "true";
+}
+
+function syncDesiredSoundToControl() {
+  const control = soundButton();
+  if (!control) return false;
+  const current = readSoundControlState();
+  if (desiredSoundOn === null) {
+    desiredSoundOn = current;
+  } else if (current !== desiredSoundOn) {
+    control.click();
+  }
+  return true;
 }
 
 // CallControl.ts の onControlMutation() と同じ計算: screenshare は data-kind 属性、
@@ -291,9 +321,7 @@ function computeCallControlState() {
 // 「全て unmuted であって初めて聞こえる」という意味で AND を取る。audio が 0 件なら、後から
 // 参加者が現れた時に適用する desiredSoundOn を返し、単独参加中も deafen 状態を保持する。
 function computeSoundState() {
-  const audios = document.querySelectorAll("audio");
-  if (audios.length === 0) return desiredSoundOn;
-  return Array.from(audios).every((el) => el.muted === false);
+  return readSoundControlState() ?? desiredSoundOn ?? true;
 }
 
 // M1 step 3b 実装要件 4: NativeCallControl.ts の onCallControlState 購読が「push による再同期」
@@ -325,12 +353,22 @@ function pushCallControlState(reason) {
 // screenshareButton() 等が呼び出しのたびに document.querySelector() し直すため、この参照が古くても
 // クリック自体の到達には影響しない -- ここで守るのは「native invoke を経由しない自発的な状態変化
 // (リモート起因の自動レイアウト切替等) を属性 MutationObserver で拾って push する」経路の方。
-let observedControlElements = { screenshare: null, spotlight: null, emphasis: null };
+let observedControlElements = {
+  screenshare: null,
+  spotlight: null,
+  emphasis: null,
+  sound: null,
+};
 
 let callControlMutationObserver = null;
 function observeCallControls() {
   if (callControlMutationObserver) callControlMutationObserver.disconnect();
-  callControlMutationObserver = new MutationObserver(() => pushCallControlState("mutation-observed"));
+  callControlMutationObserver = new MutationObserver((mutations) => {
+    if (mutations.some((mutation) => mutation.target === observedControlElements.sound)) {
+      desiredSoundOn = readSoundControlState();
+    }
+    pushCallControlState("mutation-observed");
+  });
 
   const screenshareBtn = screenshareButton();
   observedControlElements.screenshare = screenshareBtn;
@@ -351,9 +389,17 @@ function observeCallControls() {
   if (emphasisBtn) {
     callControlMutationObserver.observe(emphasisBtn, { attributes: true });
   }
+  const soundBtn = soundButton();
+  observedControlElements.sound = soundBtn;
+  if (soundBtn) {
+    callControlMutationObserver.observe(soundBtn, {
+      attributes: true,
+      attributeFilter: ["aria-checked"],
+    });
+  }
 }
 
-// 追跡中の 3 要素 (screenshare/spotlight/emphasis) のいずれかが、直近 observeCallControls() が
+// 追跡中の要素 (screenshare/spotlight/emphasis/sound) のいずれかが、直近 observeCallControls() が
 // 捕まえた参照と現在の DOM 上の実体とで食い違っているか (=作り直された/消えた/現れた) を返す。
 // bodyMutationObserver のコールバックがここで「本当に対象が入れ替わったか」を先に確認してから
 // observeCallControls() (disconnect + re-observe というやや重い処理) を呼ぶことで、コントロール
@@ -362,7 +408,8 @@ function controlElementsChanged() {
   return (
     screenshareButton() !== observedControlElements.screenshare ||
     spotlightButton() !== observedControlElements.spotlight ||
-    emphasisButton() !== observedControlElements.emphasis
+    emphasisButton() !== observedControlElements.emphasis ||
+    soundButton() !== observedControlElements.sound
   );
 }
 
@@ -395,12 +442,13 @@ function ensureBodyObserver() {
     // footerVisible を確実に再適用するため (controlElementsChanged() のガードに相乗りすると、
     // 3 要素は変わらずフッターだけ差し替わったケースを取りこぼす)。
     applyFooterVisibility();
-    applyDesiredSound();
+    syncDesiredSoundToControl();
     if (controlElementsChanged()) observeCallControls();
   });
   bodyMutationObserver.observe(document.body, { childList: true, subtree: true });
   observeCallControls();
   applyFooterVisibility();
+  syncDesiredSoundToControl();
 }
 
 function clickAndReport(target, action) {
@@ -458,9 +506,9 @@ function handleToggleSettings() {
 // を呼ぶ (以前は setSoundOn/setSoundOff だけ push が無かった)。
 function handleSetSound(soundOn, action) {
   desiredSoundOn = soundOn;
-  const audioCount = applyDesiredSound();
+  const controlFound = syncDesiredSoundToControl();
   pushCallControlState(`action-${action}`);
-  return { ok: true, action, audioCount };
+  return { ok: true, action, controlFound };
 }
 
 // -------------------------------------------------------------------------------------------
