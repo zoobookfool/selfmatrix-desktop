@@ -14,6 +14,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { verifyMinisign } = require("./minisign-verify.cjs");
+const { parseTrustedComment } = require("./update-trusted-comment.cjs");
 
 // SelfMatrix リリース更新検証用の公開鍵 (Ed25519、minisign 形式)。key_id = 671E2DDA2737FAE3。
 // 運用者が 2026-07-09 にオフラインで生成した鍵ペアの公開鍵側。対応する秘密鍵
@@ -61,8 +62,24 @@ function readInstallerAndSignature(installerPath) {
 // 正当な署名を用意しての "成功系" テストができないため)。実運用での配線 (3b) は、引数無しで
 // 呼んで得られる `verifyUpdateCodeSignature` (下でエクスポートしている、RELEASE_PUBLIC_KEY を
 // 使う既定インスタンス) を MinisignNsisUpdater が呼ぶ。
+//
+// 返す検証関数は electron-updater 型の 2 引数契約 (publisherName, installerPath) => Promise<string|null>
+// に対して第 3 引数 `expected` を追加している (契約を壊さない拡張 — electron-updater 自身が直接
+// このフックを 2 引数で呼ぶ経路は使っておらず、MinisignNsisUpdater.verifySignature が必ず自分で
+// 呼び出すので、3 引数目を渡す配線側も自前で用意できる)。
+//
+// バージョン束縛 (ダウングレード攻撃対策、design/release-pipeline.md の P1 指摘): expected は
+// { expectedVersion, expectedFileName } の形で、electron-updater が latest.yml から読んだ
+// updateInfo.version / installer ファイル名を渡す。trusted comment (署名済みで改ざん検出済み) を
+// update-trusted-comment.cjs の正規フォーマットとしてパースし、
+//   (a) パース不能 (フォーマット外 = 旧式署名や任意コメント) -> 拒否
+//   (b) version 不一致 -> 拒否 (「過去に正規署名された古い installer + 正規 .minisig」を新しい
+//       version 番号の latest.yml と組み合わせて配る攻撃を検出する本体)
+//   (c) filename 不一致 -> 拒否
+// のいずれかで fail-closed に倒す。expected 自体が渡されない (呼び忘れ) 場合も、チェックが
+// 素通りしてバージョン束縛が骨抜きになるのを避けるため明示的に拒否する。
 function createVerifyUpdateCodeSignature(publicKeyText = RELEASE_PUBLIC_KEY) {
-  return async function verifyUpdateCodeSignature(_publisherName, installerPath) {
+  return async function verifyUpdateCodeSignature(_publisherName, installerPath, expected) {
     const read = readInstallerAndSignature(installerPath);
     if (!read.ok) return read.reason;
 
@@ -71,8 +88,42 @@ function createVerifyUpdateCodeSignature(publicKeyText = RELEASE_PUBLIC_KEY) {
       sigText: read.sigText,
       publicKeyText,
     });
+    if (!result.ok) return result.reason;
 
-    return result.ok ? null : result.reason;
+    const expectedVersion = expected && expected.expectedVersion;
+    const expectedFileName = expected && expected.expectedFileName;
+    if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
+      return (
+        "update version binding missing: expectedVersion was not supplied to signature " +
+        "verification (fail-closed; downgrade-attack defense requires it)"
+      );
+    }
+    if (typeof expectedFileName !== "string" || expectedFileName.length === 0) {
+      return (
+        "update version binding missing: expectedFileName was not supplied to signature " +
+        "verification (fail-closed; downgrade-attack defense requires it)"
+      );
+    }
+
+    const parsedComment = parseTrustedComment(result.trustedComment);
+    if (!parsedComment.ok) {
+      return `update version binding rejected: ${parsedComment.reason}`;
+    }
+    if (parsedComment.version !== expectedVersion) {
+      return (
+        `update version mismatch: installer trusted comment declares version ` +
+        `'${parsedComment.version}' but update metadata declares '${expectedVersion}' ` +
+        `(possible downgrade attack)`
+      );
+    }
+    if (parsedComment.fileName !== expectedFileName) {
+      return (
+        `update filename mismatch: installer trusted comment declares file ` +
+        `'${parsedComment.fileName}' but update metadata declares '${expectedFileName}'`
+      );
+    }
+
+    return null;
   };
 }
 

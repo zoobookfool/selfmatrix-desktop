@@ -55,10 +55,14 @@ git push origin vX.Y.Z
 
 1. draft releaseから `SelfMatrix-Setup-X.Y.Z.exe` を取得します。
 2. attestationと`SHA256SUMS`を確認します。
-3. オフライン環境で署名します。
+3. オフライン環境で署名します。**`-t` (trusted comment) は必須です** — 省略すると正規リリースの
+   署名でもアプリが拒否します (下記「バージョン束縛」参照)。trusted comment は次の正規フォーマット
+   ちょうどにしてください: `selfmatrix-desktop <version> <installer名>`
+   (version は `package.json`/タグと同じ先頭 `v` なしのsemver、installer名は拡張子込みのファイル名
+   そのもの)。
 
 ```sh
-minisign -S -s selfmatrix.sec -m SelfMatrix-Setup-X.Y.Z.exe
+minisign -S -s selfmatrix.sec -t "selfmatrix-desktop X.Y.Z SelfMatrix-Setup-X.Y.Z.exe" -m SelfMatrix-Setup-X.Y.Z.exe
 ```
 
 4. 初回公開時は、実minisign binaryが作った `.minisig` をアプリ内検証器へ渡し `ok: true` を確認します。
@@ -69,6 +73,21 @@ minisign -S -s selfmatrix.sec -m SelfMatrix-Setup-X.Y.Z.exe
 **`.minisig` が無い状態ではpublishしないでください。** アプリはinstaller URLに `.minisig` を足した
 sidecarを同じreleaseから取得し、署名欠落・不一致・改ざんをすべて拒否します。`latest.yml` とinstaller
 だけ公開しても自動更新はfail-closedで失敗します。
+
+### バージョン束縛 (ダウングレード攻撃対策)
+
+minisign 署名は installer の**バイト列**にしか縛られておらず、`latest.yml` が宣言する
+**バージョン**には縛られません。`-t` を省略した (または内容が正規フォーマット外の) 署名は、
+GitHub アカウントが乗っ取られた場合に「過去に正規署名された古い installer + その正規 `.minisig`」
+を新しいバージョン番号の `latest.yml` で配るサイレントダウングレード攻撃を許してしまいます
+(`allowDowngrade=false` は `latest.yml` の自己申告バージョン比較でしかなく、これには効きません)。
+
+そのためアプリ側の検証器 (`src/update-signature-verify.cjs`) は、署名済み (改ざん検出済み)
+trusted comment を `selfmatrix-desktop <version> <installer名>` としてパースし、`latest.yml` の
+version・installer名と一致することまで確認します。**`-t` を忘れた署名、あるいは version や
+installer名が `latest.yml` と食い違う署名は、ファイル本体の署名検証自体は正しくても更新適用が
+拒否されます。** 新しい version でリリースするたびに、必ずその version 用に installer を
+`-t` 付きで署名し直してください (古いバージョンの `.minisig` を使い回さない)。
 
 ## 5. 初回公開後の確認
 

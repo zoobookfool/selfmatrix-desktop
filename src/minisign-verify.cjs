@@ -231,7 +231,12 @@ function verifyMinisign({ fileBytes, sigText, publicKeyText }) {
     };
   }
 
-  return { ok: true };
+  // 呼び出し側 (update-signature-verify.cjs) がバージョン束縛 (ダウングレード攻撃対策) に使える
+  // よう、検証済みの trusted comment 生テキストを結果に含める。ここまで到達しているのは 2 段の
+  // Ed25519 検証 (ファイル本体 + trusted comment の改ざん検出) を両方通過した後だけなので、
+  // このテキストは「署名者が実際に署名した trusted comment」であることが保証されている
+  // (検証ロジック自体は上のガード群のままで、ここは結果を露出するだけ)。
+  return { ok: true, trustedComment: sig.trustedComment };
 }
 
 module.exports = {

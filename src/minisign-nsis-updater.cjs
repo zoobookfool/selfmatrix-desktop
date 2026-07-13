@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs/promises");
+const path = require("node:path");
 const { NsisUpdater } = require("electron-updater");
 const { verifyUpdateCodeSignature } = require("./update-signature-verify.cjs");
 
@@ -48,10 +49,17 @@ class MinisignNsisUpdater extends NsisUpdater {
     const helper = await this.getOrCreateDownloadHelper();
     await helper.clear();
 
+    // バージョン束縛 (ダウングレード攻撃対策): electron-updater が latest.yml から読んだ
+    // updateInfo.version と installer のファイル名 (URL の最終セグメント) を、後で
+    // verifySignature() が verifyMinisignUpdate() へ渡す期待値として保持する。
+    // installer.url.pathname は URL の pathname なので常に '/' 区切り (Windows でも) --
+    // path.win32.basename ではなく path.posix.basename で切り出す。
     this.signatureDownloadContext = {
       installerUrl: installer.url,
       requestHeaders: downloadUpdateOptions.requestHeaders,
       cancellationToken: downloadUpdateOptions.cancellationToken,
+      expectedVersion: info.version,
+      expectedFileName: path.posix.basename(decodeURIComponent(installer.url.pathname)),
     };
 
     try {
@@ -76,7 +84,10 @@ class MinisignNsisUpdater extends NsisUpdater {
         headers: context.requestHeaders,
         cancellationToken: context.cancellationToken,
       });
-      return await this.verifyMinisignUpdate([], tempUpdateFile);
+      return await this.verifyMinisignUpdate([], tempUpdateFile, {
+        expectedVersion: context.expectedVersion,
+        expectedFileName: context.expectedFileName,
+      });
     } catch (error) {
       return `minisign signature download/verification failed: ${errorMessage(error)}`;
     } finally {
